@@ -16,9 +16,31 @@ data only, and token cost is bounded by design.
 
 ## Install
 
+Download the archive for your platform from
+[GitHub Releases](https://github.com/Aero123421/WebSeek-CLI/releases), verify
+it against `SHA256SUMS.txt`, and put the `webseek` binary on your PATH:
+
 ```sh
-cargo install webseek          # from crates.io (once published)
-# or from source:
+# Linux / macOS
+tar -xzf webseek-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+chmod +x webseek
+sudo mv webseek /usr/local/bin/
+```
+
+```powershell
+# Windows
+Expand-Archive webseek-v0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
+```
+
+Archives are published for Linux x86_64, Windows x86_64 (`webseek.exe`),
+macOS Intel, and macOS Apple Silicon. macOS binaries are unsigned — if
+Gatekeeper complains on first run: `xattr -d com.apple.quarantine ./webseek`.
+
+Or build from source (Rust 1.75+):
+
+```sh
+git clone https://github.com/Aero123421/WebSeek-CLI.git
+cd WebSeek-CLI
 cargo install --path .
 ```
 
@@ -245,19 +267,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-## Releases
-
-Pushing a version tag (`v*`) starts the release workflow after its quality
-gate (format, clippy, and tests). It builds and tests native release binaries
-on GitHub-hosted runners for Linux x86_64, Windows x86_64, macOS Intel, and
-macOS Apple Silicon. The workflow creates a GitHub Release with the archives
-and a `SHA256SUMS.txt` checksum file; it does not publish to crates.io.
-
-```sh
-git tag v0.2.0
-git push origin v0.2.0
-```
-
 Project layout:
 
 ```
@@ -284,11 +293,31 @@ tests/
   batch.rs      batch-fetch + robots.txt integration tests (wiremock)
 ```
 
+## Releases
+
+Pushing a version tag (`v*`) starts the release workflow: a quality gate
+(format, clippy, tests), then release builds for each platform, packaged and
+published as a GitHub Release with a `SHA256SUMS.txt` checksum file. Nothing
+is published to crates.io.
+
+| Asset | Platform |
+|---|---|
+| `webseek-<tag>-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+| `webseek-<tag>-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `webseek-<tag>-x86_64-apple-darwin.tar.gz` | macOS Intel (cross-compiled) |
+| `webseek-<tag>-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+
+To publish a release:
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
+```
+
 ## Roadmap
 
 - [ ] `--sites:` operator to restrict results to a domain
 - [ ] CI canary that detects a broken parser (feeds an AI-assisted repair loop)
-- [ ] cargo-dist release automation (3-OS binaries + installers)
 
 ## License
 
