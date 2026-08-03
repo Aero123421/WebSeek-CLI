@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tag-driven GitHub Release automation. Pushing a `v*` tag now validates the
+  project, builds native Linux x86_64, Windows x86_64, macOS Intel, and macOS
+  Apple Silicon binaries, and attaches checksummed archives to a GitHub
+  Release.
+
 ## [0.2.0]
 
 ### Added

@@ -245,6 +245,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
+## Releases
+
+Pushing a version tag (`v*`) starts the release workflow after its quality
+gate (format, clippy, and tests). It builds and tests native release binaries
+on GitHub-hosted runners for Linux x86_64, Windows x86_64, macOS Intel, and
+macOS Apple Silicon. The workflow creates a GitHub Release with the archives
+and a `SHA256SUMS.txt` checksum file; it does not publish to crates.io.
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
 Project layout:
 
 ```
