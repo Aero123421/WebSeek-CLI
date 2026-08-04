@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- One-liner installers: `install.sh` (Linux/macOS) and `install.ps1`
+  (Windows) detect the platform, download the latest release, verify the
+  SHA-256 checksum, and install `webseek` onto the PATH.
 - Tag-driven GitHub Release automation. Pushing a `v*` tag now validates the
   project, builds Linux x86_64, Windows x86_64, macOS Intel (cross-compiled),
   and macOS Apple Silicon binaries, and attaches checksummed archives to a

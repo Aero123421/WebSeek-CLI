@@ -110,12 +110,13 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          files=(release/*)
+          cd release
+          files=(*)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "No release artifacts were downloaded." >&2
             exit 1
           fi
-          sha256sum "${files[@]}" > release/SHA256SUMS.txt
+          sha256sum "${files[@]}" > SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:

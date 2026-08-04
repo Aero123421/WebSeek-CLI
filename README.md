@@ -16,7 +16,26 @@ data only, and token cost is bounded by design.
 
 ## Install
 
-Download the archive for your platform from
+One-liners (download the latest release, verify its SHA-256 checksum, and put
+`webseek` on your PATH):
+
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/Aero123421/WebSeek-CLI/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/Aero123421/WebSeek-CLI/main/install.ps1 | iex
+```
+
+The installers pick the right archive automatically — Linux x86_64/arm64,
+macOS Intel/Apple Silicon, Windows x86_64 (`webseek.exe`) — and verify it
+against `SHA256SUMS.txt`. Override the install location with the
+`WEBSEEK_INSTALL_DIR` environment variable. macOS binaries are unsigned — if
+Gatekeeper complains on first run: `xattr -d com.apple.quarantine ./webseek`.
+
+Prefer manual? Grab the archive for your platform from
 [GitHub Releases](https://github.com/Aero123421/WebSeek-CLI/releases), verify
 it against `SHA256SUMS.txt`, and put the `webseek` binary on your PATH:
 
@@ -31,10 +50,6 @@ sudo mv webseek /usr/local/bin/
 # Windows
 Expand-Archive webseek-v0.2.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
 ```
-
-Archives are published for Linux x86_64, Windows x86_64 (`webseek.exe`),
-macOS Intel, and macOS Apple Silicon. macOS binaries are unsigned — if
-Gatekeeper complains on first run: `xattr -d com.apple.quarantine ./webseek`.
 
 Or build from source (Rust 1.75+):
 
