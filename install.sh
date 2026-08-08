@@ -92,13 +92,23 @@ if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
     fi
 fi
 
+# Stage the file *inside* install_dir before the final rename: `$tmpdir` and
+# `$install_dir` can be on different filesystems, and `mv` across filesystems
+# falls back to copy-then-delete, which is not atomic — a process reading
+# webseek concurrently (or the currently-running old binary, mid-upgrade)
+# could briefly see a truncated file. A rename within the same directory is
+# atomic on every POSIX filesystem.
+staged="$install_dir/.webseek.tmp.$$"
 if [ -w "$install_dir" ]; then
-    mv "$tmpdir/webseek" "$install_dir/webseek"
+    cp "$tmpdir/webseek" "$staged"
+    chmod +x "$staged"
+    mv -f "$staged" "$install_dir/webseek"
 else
     note "Installing to $install_dir (requires sudo)"
-    sudo mv "$tmpdir/webseek" "$install_dir/webseek"
+    sudo cp "$tmpdir/webseek" "$staged"
+    sudo chmod +x "$staged"
+    sudo mv -f "$staged" "$install_dir/webseek"
 fi
-chmod +x "$install_dir/webseek" 2>/dev/null || true
 
 case ":$PATH:" in
     *":$install_dir:"*) ;;

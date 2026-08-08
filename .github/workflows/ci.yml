@@ -16,8 +16,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,14 +32,41 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # --locked everywhere, matching the Release workflow: PR/main CI must
+      # resolve the exact same dependency graph release builds do, or a
+      # passing PR can still fail to build once tagged.
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       - name: Release build
-        run: cargo build --release
+        run: cargo build --locked --release
+
+  msrv:
+    name: MSRV (1.89.0)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Pinned to Cargo.toml's declared `rust-version`, not `stable`: this is
+      # the check that would have caught the previous MSRV/dependency
+      # mismatch (declaring 1.75 while the lockfile required 1.85+).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check against declared MSRV
+        run: cargo check --locked --all-targets --all-features
 
   audit:
     name: security audit
@@ -45,6 +76,8 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: rustsec/audit-check@v2.0.0
         with:

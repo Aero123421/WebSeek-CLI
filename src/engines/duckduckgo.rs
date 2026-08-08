@@ -3,12 +3,11 @@
 //! No API key required. The HTML layout is scraped with `scraper`; the
 //! parser lives in [`parse_html`] as a pure function so it is unit-testable.
 
-use reqwest::blocking::Client;
-use scraper::{Html, Selector};
 use url::Url;
 
 use crate::engines::{dedupe_by_url, SearchEngine};
 use crate::error::{Error, Result};
+use crate::http::Http;
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::normalize_snippet;
 
@@ -38,7 +37,7 @@ impl SearchEngine for DuckDuckGo {
         "duckduckgo"
     }
 
-    fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
+    fn search(&self, http: &Http, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let kl = opts.region.as_deref().and_then(crate::region::ddg_kl);
         let mut params: Vec<(&str, &str)> = vec![("q", query)];
         if let Some(kl) = &kl {
@@ -50,54 +49,63 @@ impl SearchEngine for DuckDuckGo {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
-            .map_err(|e| Error::Network(format!("duckduckgo request failed: {e}")))?;
-        let status = resp.status();
-        if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-            return Err(Error::RateLimited(format!(
+        let resp = http.get(url)?;
+        let status = resp.status().as_u16();
+        if status == 202 || status == 429 || status == 403 {
+            return Err(Error::rate_limited(format!(
                 "duckduckgo answered HTTP {status} (retry later or lower request rate)"
             )));
         }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
+        if !resp.status().is_success() {
+            return Err(Error::Http(status));
         }
-        let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_html(&body);
+        let body = crate::http::text_capped(resp, crate::http::MAX_API_BODY_BYTES)?;
+        // Dedupe *before* truncating to `count`: otherwise a duplicate near
+        // the top of the page silently shrinks the result count below what
+        // was asked for even though more unique hits exist further down.
+        let mut results = dedupe_by_url(parse_html(&body.text), |r| &r.url);
         results.truncate(opts.count);
-        Ok(dedupe_by_url(results, |r| &r.url))
+        Ok(results)
     }
+}
+
+/// Class tokens DuckDuckGo actually uses to mark a sponsored result. A bare
+/// substring check (`token.contains("ad")`) also matches unrelated tokens
+/// like `shadow`, `loaded` or `gradient` — this is an exact, word-boundary
+/// match instead (tokens are already split on whitespace by the caller).
+const AD_TOKENS: &[&str] = &["ad", "ads", "result--ad", "badge--ad", "sponsored"];
+
+fn is_ad_result(class_attr: Option<&str>) -> bool {
+    class_attr
+        .map(|c| c.split_whitespace().any(|t| AD_TOKENS.contains(&t)))
+        .unwrap_or(false)
 }
 
 /// Pure parser for the DDG HTML result page. Unit-tested against fixtures.
 pub fn parse_html(html: &str) -> Vec<SearchResult> {
-    let doc = Html::parse_document(html);
-    let result_sel = Selector::parse(".result").unwrap_or_else(|_| unreachable!("static"));
-    let link_sel = Selector::parse("a.result__a").unwrap_or_else(|_| unreachable!("static"));
+    let doc = scraper::Html::parse_document(html);
+    let result_sel = scraper::Selector::parse(".result").unwrap_or_else(|_| unreachable!("static"));
+    let link_sel =
+        scraper::Selector::parse("a.result__a").unwrap_or_else(|_| unreachable!("static"));
     let snippet_sel =
-        Selector::parse(".result__snippet").unwrap_or_else(|_| unreachable!("static"));
+        scraper::Selector::parse(".result__snippet").unwrap_or_else(|_| unreachable!("static"));
 
     let mut out = Vec::new();
     for result in doc.select(&result_sel) {
-        // Skip ad blocks (DDG marks them with an "ad" class token).
-        let is_ad = result
-            .value()
-            .attr("class")
-            .map(|c| c.split_whitespace().any(|t| t.contains("ad")))
-            .unwrap_or(false);
-        if is_ad {
+        if is_ad_result(result.value().attr("class")) {
             continue;
         }
         let mut title = String::new();
-        let mut url = String::new();
+        let mut url = None;
         if let Some(a) = result.select(&link_sel).next() {
             title = a.text().collect::<String>().trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = decode_redirect(href).unwrap_or_else(|| href.to_string());
+                url = normalize_result_url(href);
             }
         }
-        if title.is_empty() || url.is_empty() {
-            continue; // empty rows and dead links
-        }
+        let (Some(url), false) = (url, title.is_empty()) else {
+            continue; // empty rows, dead links, or an unsafe/invalid URL
+        };
         let snippet = result
             .select(&snippet_sel)
             .next()
@@ -110,6 +118,32 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
         });
     }
     out
+}
+
+/// Turn a raw `href` into a safe absolute http(s) URL, or `None` to drop the
+/// result. Handles three shapes: DDG's `/l/?uddg=` redirect wrapper,
+/// protocol-relative links (`//example.com/...`), and ordinary absolute
+/// links — the first two used to reach the output either un-decoded or
+/// without a scheme.
+fn normalize_result_url(href: &str) -> Option<String> {
+    if let Some(decoded) = decode_redirect(href) {
+        return only_http(&decoded);
+    }
+    let absolute = match href.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => href.to_string(),
+    };
+    only_http(&absolute)
+}
+
+/// Parse `candidate`, keeping only http(s) results — and returning the
+/// *parsed* URL's canonical string, not the raw input. Returning the raw
+/// string would be wrong for a bare `https:host/path` input: the URL parser
+/// normalizes that (WHATWG's special-scheme handling inserts the missing
+/// `//`), so the un-reparsed original string would still be missing it.
+fn only_http(candidate: &str) -> Option<String> {
+    let url = Url::parse(candidate).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 /// DDG wraps result links in `/l/?uddg=<encoded>` redirects; unwrap them.
@@ -149,18 +183,44 @@ mod tests {
       <div class="result result--ad"> <!-- ad: no title link -->
         <a class="result__a" href="//duckduckgo.com/l/?uddg=ads">Sponsored ad</a>
       </div>
+      <div class="result">
+        <a class="result__a" href="//plain.example.org/direct">Protocol relative link</a>
+      </div>
+      <div class="result">
+        <a class="result__a" href="javascript:alert(1)">Dangerous scheme</a>
+      </div>
     </body></html>"#;
 
     #[test]
     fn parses_results_and_skips_ads() {
         let results = parse_html(FIXTURE);
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Rust programming language");
         assert_eq!(results[0].url, "https://example.com/rust");
         assert_eq!(
             results[0].snippet,
             "Rust is a blazingly fast systems language with memory safety."
         );
+    }
+
+    #[test]
+    fn protocol_relative_links_get_an_https_scheme() {
+        let results = parse_html(FIXTURE);
+        assert_eq!(results[1].url, "https://plain.example.org/direct");
+    }
+
+    #[test]
+    fn dangerous_schemes_are_dropped_not_passed_through() {
+        let results = parse_html(FIXTURE);
+        assert!(results.iter().all(|r| r.url.starts_with("http")));
+        assert!(!results.iter().any(|r| r.title == "Dangerous scheme"));
+    }
+
+    #[test]
+    fn ad_detection_does_not_false_positive_on_unrelated_classes() {
+        assert!(!is_ad_result(Some("shadow loaded gradient header")));
+        assert!(is_ad_result(Some("result result--ad")));
+        assert!(is_ad_result(Some("ad")));
     }
 
     #[test]
@@ -171,7 +231,21 @@ mod tests {
             Some("https://example.com/rust")
         );
         assert_eq!(decode_redirect("https://example.com/plain"), None);
-        // Non-redirect DDG links stay untouched (returned by caller as-is).
         assert_eq!(decode_redirect("//duckduckgo.com/about"), None);
+    }
+
+    #[test]
+    fn dedupe_runs_before_truncate() {
+        let html = r#"<html><body>
+          <div class="result"><a class="result__a" href="https://x.example/a">A</a></div>
+          <div class="result"><a class="result__a" href="https://x.example/a">A dup</a></div>
+          <div class="result"><a class="result__a" href="https://x.example/b">B</a></div>
+        </body></html>"#;
+        let mut results = dedupe_by_url(parse_html(html), |r| &r.url);
+        results.truncate(2);
+        // Both unique URLs must survive even though a duplicate came first.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://x.example/a");
+        assert_eq!(results[1].url, "https://x.example/b");
     }
 }

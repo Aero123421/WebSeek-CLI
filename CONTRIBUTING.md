@@ -14,6 +14,13 @@ high but the surface area small. This guide gets you productive fast.
   the golden tests + CHANGELOG).
 - **Be gentle upstream.** These are scraped endpoints, not public APIs. Keep
   the default delay, don't hammer, and prefer opt-in for anything aggressive.
+- **Every network call goes through `Http`** (`src/http.rs`), never a raw
+  `reqwest::Client`. That's what gives every engine the SSRF egress guard,
+  the shared per-origin rate limiter, and retry/backoff for free — a `Client`
+  reference bypasses all three.
+- **A parser returning `Vec::new()` means "found nothing," never "couldn't
+  tell."** JSON API parsers return `Result<Vec<_>>`; a deserialize failure or
+  an API error object is a `Parse` error, not an empty list.
 
 ## Development setup
 
@@ -25,8 +32,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-CI runs fmt + clippy(`-D warnings`) + tests on Linux/macOS/Windows, plus a
-`cargo-audit` security job. Please keep all four green before opening a PR.
+CI runs fmt + clippy(`-D warnings`) + tests on Linux/macOS/Windows, a pinned
+MSRV check (`cargo check` on the exact `rust-version` in `Cargo.toml` — not
+just `stable`, which is how a previous MSRV/dependency mismatch slipped
+through), and a `cargo-audit` security job. Please keep all green before
+opening a PR.
 
 ## Testing conventions
 
@@ -43,12 +53,24 @@ CI runs fmt + clippy(`-D warnings`) + tests on Linux/macOS/Windows, plus a
 
 ## Adding a new engine
 
-1. Implement the `SearchEngine` and/or `ImageEngine` trait in `src/engines/`.
-2. Keep the parser a pure function with a fixture-based unit test.
-3. Register it in `engine_by_name` / `image_engine_by_name` and in
-   `config::validate_engine` / `validate_image_engine`.
-4. Add an integration test in `tests/engines.rs` using `with_base(...)` to
-   point the engine at the mock server.
+1. Implement the `SearchEngine` and/or `ImageEngine` trait in `src/engines/`,
+   using `&Http` (never a raw `Client`) for every request.
+2. Keep the parser a pure function returning `Result<Vec<_>>` (for JSON APIs;
+   HTML scrapers may return a plain `Vec` since an empty selector match is a
+   genuinely different situation from a parse error), with a fixture-based
+   unit test that also covers malformed/error-shaped input.
+3. Register it **once**, as an `EngineDescriptor` in `TEXT_REGISTRY` (or
+   `ImageEngineDescriptor` in `IMAGE_REGISTRY`) in `src/engines/mod.rs`. That
+   single entry drives `engine_by_name`, `validate_engine`, the `webseek
+   engines` catalog, and fallback grouping — there is nowhere else to
+   register it. Pick a `Capability` for text engines: reuse `GeneralWeb` only
+   if the new engine is a genuinely interchangeable general-web-search
+   source; otherwise give it its own capability so automatic fallback never
+   silently substitutes a different kind of source (see the `Capability` doc
+   comment for why almost every vertical gets a capability of one).
+4. Add an integration test in `tests/engines.rs` or `tests/verticals.rs`
+   using `with_base(...)` to point the engine at the mock server, and
+   `Http::for_tests(client)` to get a permissive (test-only) egress policy.
 5. Document it in the README "Engines & ethics" section and the CHANGELOG.
 
 ## Pull requests
