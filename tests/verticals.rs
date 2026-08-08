@@ -16,14 +16,16 @@ use webseek::engines::reddit::Reddit;
 use webseek::engines::stackexchange::StackExchange;
 use webseek::engines::wikipedia::Wikipedia;
 use webseek::engines::SearchEngine;
+use webseek::http::Http;
 use webseek::models::SearchOpts;
 
-fn client() -> Client {
-    Client::builder()
+fn http() -> Http {
+    let client = Client::builder()
         .user_agent("webseek-test")
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap()
+        .unwrap();
+    Http::for_tests(client)
 }
 
 fn opts() -> SearchOpts {
@@ -56,7 +58,7 @@ fn wikipedia_engine_full_pipeline() {
             .await;
     });
     let engine = Wikipedia::with_base(format!("{}/w/api.php", server.uri()));
-    let r = engine.search(&client(), "rust", &opts()).unwrap();
+    let r = engine.search(&http(), "rust", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].title, "Rust");
     assert_eq!(r[0].snippet, "a systems language");
@@ -76,7 +78,7 @@ fn hackernews_engine_full_pipeline() {
             .await;
     });
     let engine = HackerNews::with_base(format!("{}/search", server.uri()));
-    let r = engine.search(&client(), "x", &opts()).unwrap();
+    let r = engine.search(&http(), "x", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].url, "https://x.dev");
 }
@@ -95,7 +97,7 @@ fn openalex_engine_full_pipeline() {
             .await;
     });
     let engine = OpenAlex::with_base(format!("{}/works", server.uri()));
-    let r = engine.search(&client(), "x", &opts()).unwrap();
+    let r = engine.search(&http(), "x", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].title, "Paper");
     assert_eq!(r[0].snippet, "2020 · cited 5");
@@ -109,13 +111,13 @@ fn crossref_engine_full_pipeline() {
         Mock::given(method("GET"))
             .and(path("/works"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"message":{"items":[{"DOI":"10.1/x","title":["T"],"URL":"https://doi.org/10.1/x","container-title":["J"],"published":{"date-parts":[[2019]]},"is-referenced-by-count":2}]}}"#,
+                r#"{"status":"ok","message":{"items":[{"DOI":"10.1/x","title":["T"],"URL":"https://doi.org/10.1/x","container-title":["J"],"published":{"date-parts":[[2019]]},"is-referenced-by-count":2}]}}"#,
             ))
             .mount(&server)
             .await;
     });
     let engine = CrossRef::with_base(format!("{}/works", server.uri()));
-    let r = engine.search(&client(), "x", &opts()).unwrap();
+    let r = engine.search(&http(), "x", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].snippet, "J · 2019 · cited 2");
 }
@@ -144,7 +146,7 @@ fn pubmed_engine_two_step_pipeline() {
         format!("{}/esearch", server.uri()),
         format!("{}/esummary", server.uri()),
     );
-    let r = engine.search(&client(), "x", &opts()).unwrap();
+    let r = engine.search(&http(), "x", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].title, "A study");
     assert_eq!(r[0].url, "https://pubmed.ncbi.nlm.nih.gov/11/");
@@ -171,11 +173,11 @@ fn package_engines_full_pipeline() {
             .await;
     });
     let crates = Crates::with_base(format!("{}/crates", server.uri()));
-    let r = crates.search(&client(), "async", &opts()).unwrap();
+    let r = crates.search(&http(), "async", &opts()).unwrap();
     assert_eq!(r[0].title, "tokio");
 
     let npm = Npm::with_base(format!("{}/npm", server.uri()));
-    let r = npm.search(&client(), "async", &opts()).unwrap();
+    let r = npm.search(&http(), "async", &opts()).unwrap();
     assert_eq!(r[0].title, "async");
 }
 
@@ -190,7 +192,7 @@ fn pypi_404_is_empty_not_error() {
             .await;
     });
     let engine = PyPi::with_base(server.uri());
-    let r = engine.search(&client(), "nope", &opts()).unwrap();
+    let r = engine.search(&http(), "nope", &opts()).unwrap();
     assert!(
         r.is_empty(),
         "404 should map to empty results, not an error"
@@ -218,12 +220,12 @@ fn stackexchange_and_nominatim_full_pipeline() {
             .await;
     });
     let se = StackExchange::with_base(format!("{}/se", server.uri()));
-    let r = se.search(&client(), "x", &opts()).unwrap();
+    let r = se.search(&http(), "x", &opts()).unwrap();
     assert_eq!(r[0].title, "Q & A");
     assert_eq!(r[0].snippet, "[rust] · score 5 · 2 answers ✓");
 
     let geo = Nominatim::with_base(format!("{}/geo", server.uri()));
-    let r = geo.search(&client(), "town", &opts()).unwrap();
+    let r = geo.search(&http(), "town", &opts()).unwrap();
     assert_eq!(r[0].title, "Town");
     assert_eq!(r[0].url, "https://www.openstreetmap.org/node/1");
 }
@@ -248,7 +250,7 @@ fn reddit_atom_full_pipeline() {
             .await;
     });
     let engine = Reddit::with_base(format!("{}/search.rss", server.uri()));
-    let r = engine.search(&client(), "rust", &opts()).unwrap();
+    let r = engine.search(&http(), "rust", &opts()).unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].title, "Rust & things");
     assert_eq!(r[0].url, "https://www.reddit.com/r/rust/comments/z/t/");

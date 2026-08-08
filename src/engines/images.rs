@@ -5,22 +5,36 @@
 //! - **DuckDuckGo Images**: fetches a one-time `vqd` token from the image
 //!   page, then queries the JSON endpoint `duckduckgo.com/i.js`.
 //!
-//! Both parsers are pure functions, unit-tested with fixtures.
+//! Both search parsers are pure functions, unit-tested with fixtures.
+//!
+//! Downloading is a single streamed GET per image, capped at `max_bytes + 1`
+//! bytes so the limit is enforced regardless of `Content-Length` (absent,
+//! chunked, or simply wrong), followed by content sniffing: the response
+//! must actually look like the image format its own magic bytes claim, so an
+//! HTML error page served with `Content-Type: image/jpeg` is rejected
+//! instead of saved as a `.jpg`. Every URL's outcome is reported
+//! individually — one failure never aborts the rest of the batch — and an
+//! existing file is never silently overwritten.
 
+use std::io::Write as _;
 use std::path::Path;
 
-use reqwest::blocking::Client;
-use scraper::{Html, Selector};
+use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
 use crate::engines::{dedupe_by_url, ImageEngine};
 use crate::error::{Error, Result};
+use crate::http::Http;
 use crate::models::ImageResult;
-use crate::text::sanitize_name;
+use crate::net;
 
-/// Default cap for downloaded images when `--max-bytes` is not given.
+/// Default cap for downloaded images when config/`--max-bytes` don't
+/// override it. The single source of truth for this default — `config.rs`
+/// reads it too — so the CLI help text and the actual behavior cannot drift
+/// apart the way two independently hardcoded `5 * 1024 * 1024` literals did.
 pub const DEFAULT_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+use crate::text::sanitize_name;
 
 pub struct BingImages {
     /// Endpoint base; overridable for tests and mirrors.
@@ -76,7 +90,7 @@ impl ImageEngine for BingImages {
 
     fn search(
         &self,
-        client: &Client,
+        http: &Http,
         query: &str,
         count: usize,
         safe: bool,
@@ -88,13 +102,8 @@ impl ImageEngine for BingImages {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
-            .map_err(|e| Error::Network(format!("bing images request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
-        let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_bing_html(&body);
+        let body = http.get_text(url, crate::http::MAX_API_BODY_BYTES)?;
+        let mut results = parse_bing_html(&body.text);
         results.truncate(count);
         Ok(dedupe_by_url(results, |r| &r.url))
     }
@@ -107,12 +116,12 @@ impl ImageEngine for DuckDuckGoImages {
 
     fn search(
         &self,
-        client: &Client,
+        http: &Http,
         query: &str,
         count: usize,
         safe: bool,
     ) -> Result<Vec<ImageResult>> {
-        let vqd = fetch_vqd(client, query, safe, &self.page_base)?;
+        let vqd = fetch_vqd(http, query, safe, &self.page_base)?;
         let mut params = vec![("q", query), ("o", "json"), ("vqd", vqd.as_str())];
         if safe {
             params.push(("p", "1"));
@@ -120,45 +129,43 @@ impl ImageEngine for DuckDuckGoImages {
         let url = Url::parse_with_params(&self.json_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
-            .map_err(|e| Error::Network(format!("duckduckgo images request failed: {e}")))?;
+        let resp = http.get(url)?;
         let status = resp.status();
         if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-            return Err(Error::RateLimited(format!(
+            return Err(Error::rate_limited(format!(
                 "duckduckgo answered HTTP {status} (retry later or lower request rate)"
             )));
         }
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_ddg_json(&body)?;
+        let body = crate::http::text_capped(resp, crate::http::MAX_API_BODY_BYTES)?;
+        let mut results = parse_ddg_json(&body.text)?;
         results.truncate(count);
         Ok(dedupe_by_url(results, |r| &r.url))
     }
 }
 
 /// Grab the one-time `vqd` token DDG requires for its image JSON API.
-fn fetch_vqd(client: &Client, query: &str, safe: bool, page_base: &str) -> Result<String> {
+fn fetch_vqd(http: &Http, query: &str, safe: bool, page_base: &str) -> Result<String> {
     let mut params = vec![("q", query), ("iax", "images"), ("ia", "images")];
     if safe {
         params.push(("p", "1"));
     }
     let url = Url::parse_with_params(page_base, &params)
         .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-    let resp = crate::http::send_with_retry(&client.get(url))
-        .map_err(|e| Error::Network(format!("duckduckgo vqd request failed: {e}")))?;
+    let resp = http.get(url)?;
     let status = resp.status();
     if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-        return Err(Error::RateLimited(format!(
+        return Err(Error::rate_limited(format!(
             "duckduckgo answered HTTP {status} while fetching vqd token"
         )));
     }
     if !status.is_success() {
         return Err(Error::Http(status.as_u16()));
     }
-    let body = resp.text().map_err(Error::from)?;
-    extract_vqd(&body).ok_or_else(|| {
+    let body = crate::http::text_capped(resp, crate::http::MAX_API_BODY_BYTES)?;
+    extract_vqd(&body.text).ok_or_else(|| {
         Error::Parse(
             "could not locate vqd token in duckduckgo image page (page layout changed?)".into(),
         )
@@ -184,8 +191,8 @@ pub fn extract_vqd(html: &str) -> Option<String> {
 
 /// Pure parser for Bing Images HTML (`a.iusc` elements with JSON `m` attrs).
 pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
-    let doc = Html::parse_document(html);
-    let iusc_sel = Selector::parse("a.iusc").unwrap_or_else(|_| unreachable!("static"));
+    let doc = scraper::Html::parse_document(html);
+    let iusc_sel = scraper::Selector::parse("a.iusc").unwrap_or_else(|_| unreachable!("static"));
 
     let mut out = Vec::new();
     for a in doc.select(&iusc_sel) {
@@ -205,10 +212,12 @@ pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
             .filter(|t| !t.is_empty())
             .map(str::to_string)
             .or_else(|| {
-                a.select(&Selector::parse("img").unwrap_or_else(|_| unreachable!("static")))
-                    .next()
-                    .and_then(|img| img.value().attr("alt"))
-                    .map(|alt| alt.trim().to_string())
+                a.select(
+                    &scraper::Selector::parse("img").unwrap_or_else(|_| unreachable!("static")),
+                )
+                .next()
+                .and_then(|img| img.value().attr("alt"))
+                .map(|alt| alt.trim().to_string())
             })
             .unwrap_or_default();
         out.push(ImageResult {
@@ -219,8 +228,8 @@ pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
                 .and_then(|u| u.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            width: v.get("murlw").and_then(|n| n.as_u64()).map(|n| n as u32),
-            height: v.get("murlh").and_then(|n| n.as_u64()).map(|n| n as u32),
+            width: checked_dim(v.get("murlw")),
+            height: checked_dim(v.get("murlh")),
             format: format_from_url(url),
         });
     }
@@ -231,9 +240,10 @@ pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
 pub fn parse_ddg_json(body: &str) -> Result<Vec<ImageResult>> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| Error::Parse(format!("i.js response is not JSON: {e}")))?;
-    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
-        return Ok(Vec::new());
-    };
+    let results = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| Error::Parse("i.js response missing `results` array".into()))?;
     let mut out = Vec::new();
     for item in results {
         let Some(url) = item.get("image").and_then(|u| u.as_str()) else {
@@ -251,15 +261,20 @@ pub fn parse_ddg_json(body: &str) -> Result<Vec<ImageResult>> {
                 .and_then(|u| u.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            width: item.get("width").and_then(|n| n.as_u64()).map(|n| n as u32),
-            height: item
-                .get("height")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32),
+            width: checked_dim(item.get("width")),
+            height: checked_dim(item.get("height")),
             format: format_from_url(url),
         });
     }
     Ok(out)
+}
+
+/// `u64` → `u32`, dropping (rather than silently wrapping) values that don't
+/// fit — a malicious or buggy upstream sending `4294967296` should not come
+/// back out as `0`.
+fn checked_dim(v: Option<&Value>) -> Option<u32> {
+    v.and_then(|n| n.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn format_from_url(url: &str) -> String {
@@ -277,63 +292,174 @@ fn format_from_url(url: &str) -> String {
     }
 }
 
+/// Outcome of downloading one image: exactly one of `path`/`error` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadRecord {
+    pub url: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Download image results into `dir`, `limit` at most, skipping anything
-/// larger than `max_bytes`. Returns saved paths.
+/// larger than `max_bytes`. Every URL gets its own outcome; a failure on one
+/// never stops the rest.
 pub fn download(
-    client: &Client,
+    http: &Http,
     results: &[ImageResult],
     dir: &Path,
     limit: usize,
     max_bytes: usize,
-) -> Result<Vec<String>> {
+    overwrite: bool,
+) -> Result<Vec<DownloadRecord>> {
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::Config(format!("cannot create download dir {}: {e}", dir.display())))?;
-    let mut saved = Vec::new();
-    for (i, img) in results.iter().take(limit).enumerate() {
-        // Skip by Content-Length before downloading when possible.
-        if let Some(len) = client
-            .get(&img.url)
-            .send()
-            .ok()
-            .and_then(|r| r.content_length())
-        {
-            if len > max_bytes as u64 {
-                eprintln!(
-                    "[webseek] skipping {} ({} bytes > {} byte limit)",
-                    img.url, len, max_bytes
-                );
-                continue;
-            }
-        }
-        let resp = client
-            .get(&img.url)
-            .send()
-            .map_err(|e| Error::Network(format!("download {} failed: {e}", img.url)))?;
-        if !resp.status().is_success() {
-            continue; // skip dead links, keep going
-        }
-        let bytes = resp.bytes().map_err(Error::from)?;
-        if bytes.len() > max_bytes {
-            eprintln!(
-                "[webseek] skipping {} ({} bytes > {} byte limit)",
-                img.url,
-                bytes.len(),
-                max_bytes
-            );
-            continue;
-        }
-        let ext = if img.format.is_empty() {
-            "img"
-        } else {
-            &img.format
-        };
-        let name = sanitize_name(&img.title);
-        let filename = dir.join(format!("{:04}_{name}.{ext}", i + 1));
-        std::fs::write(&filename, &bytes)
-            .map_err(|e| Error::Network(format!("cannot write {}: {e}", filename.display())))?;
-        saved.push(filename.display().to_string());
+    Ok(results
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(
+            |(i, img)| match download_one(http, img, dir, i, max_bytes, overwrite) {
+                Ok(path) => DownloadRecord {
+                    url: img.url.clone(),
+                    ok: true,
+                    path: Some(path),
+                    error: None,
+                },
+                Err(e) => DownloadRecord {
+                    url: img.url.clone(),
+                    ok: false,
+                    path: None,
+                    error: Some(e.to_string()),
+                },
+            },
+        )
+        .collect())
+}
+
+fn download_one(
+    http: &Http,
+    img: &ImageResult,
+    dir: &Path,
+    index: usize,
+    max_bytes: usize,
+    overwrite: bool,
+) -> Result<String> {
+    let url = net::parse_checked(&img.url, http.policy())?;
+    let resp = http.get(url)?;
+    if !resp.status().is_success() {
+        return Err(Error::Http(resp.status().as_u16()));
     }
-    Ok(saved)
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+    if let Some(base) = &content_type {
+        if base.starts_with("text/") || *base == "application/json" || *base == "text/html" {
+            return Err(Error::UnsupportedContent {
+                content_type: base.clone(),
+            });
+        }
+    }
+
+    let raw = crate::http::read_capped(resp, max_bytes)?;
+    if raw.truncated {
+        return Err(Error::TooLarge { limit: max_bytes });
+    }
+
+    let ext = sniff_image_format(&raw.bytes).ok_or_else(|| Error::UnsupportedContent {
+        content_type: content_type.unwrap_or_default(),
+    })?;
+    if ext == "svg" {
+        // SVG can embed <script>/<foreignObject> — active content, not a
+        // plain image. Rejected by default; there is no flag to allow it
+        // yet, matching the "reject unless explicitly allowed" guidance.
+        return Err(Error::Blocked(
+            "SVG can contain active content (scripts); not downloaded".into(),
+        ));
+    }
+
+    let name = sanitize_name(&img.title);
+    let filename = dir.join(format!("{:04}_{name}.{ext}", index + 1));
+    write_new_file(&filename, &raw.bytes, overwrite)?;
+    Ok(filename.display().to_string())
+}
+
+/// Identify an image format from its magic bytes — never trust the URL
+/// extension or `Content-Type` alone, since either can lie (an error page
+/// served at a `.jpg` URL, or with `Content-Type: image/jpeg`).
+fn sniff_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(&[0x42, 0x4D]) {
+        return Some("bmp");
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("ico");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return Some("avif");
+        }
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let trimmed = head.trim_start_matches('\u{feff}').trim_start();
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && head.contains("<svg")) {
+        return Some("svg");
+    }
+    None
+}
+
+/// Write `bytes` to `path` without ever following an existing file or
+/// symlink at that location. `create_new` fails on *anything* already
+/// there, so a symlink an attacker planted at a predictable filename cannot
+/// redirect the write — the download is reported as a failure instead.
+fn write_new_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true);
+    if overwrite {
+        open_opts.create(true).truncate(true);
+    } else {
+        open_opts.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    let mut file = open_opts.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Config(format!(
+                "{} already exists (use --overwrite to replace it)",
+                path.display()
+            ))
+        } else {
+            Error::Network(format!("cannot write {}: {e}", path.display()))
+        }
+    })?;
+    file.write_all(bytes)
+        .map_err(|e| Error::Network(format!("cannot write {}: {e}", path.display())))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,7 +481,6 @@ mod tests {
         let results = parse_bing_html(BING_FIXTURE);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].url, "https://cdn.example.com/photo.jpg");
-        // `t` key wins over the img alt.
         assert_eq!(results[0].title, "Mountain sunset");
         assert_eq!(results[0].width, Some(1920));
         assert_eq!(results[0].height, Some(1080));
@@ -363,8 +488,16 @@ mod tests {
         assert_eq!(results[0].format, "jpg");
         assert_eq!(results[1].width, None);
         assert_eq!(results[1].format, "png");
-        // No `t` key -> img alt fallback.
         assert_eq!(results[1].title, "Logo");
+    }
+
+    #[test]
+    fn oversized_dimension_is_dropped_not_wrapped() {
+        // u32::MAX + 1 must not silently become 0.
+        let v: Value = serde_json::json!({"murlw": 4294967296u64});
+        assert_eq!(checked_dim(v.get("murlw")), None);
+        let v: Value = serde_json::json!({"murlw": 100u64});
+        assert_eq!(checked_dim(v.get("murlw")), Some(100));
     }
 
     #[test]
@@ -390,9 +523,76 @@ mod tests {
     }
 
     #[test]
+    fn missing_results_field_is_an_error_not_empty() {
+        let err = parse_ddg_json(r#"{"other":1}"#).unwrap_err();
+        assert_eq!(err.code(), "parse_failed");
+    }
+
+    #[test]
     fn format_from_url_works() {
         assert_eq!(format_from_url("https://x.com/a.JPG?w=1"), "jpg");
         assert_eq!(format_from_url("https://x.com/a.webp"), "webp");
         assert_eq!(format_from_url("https://x.com/redirect?to=/a.jpg"), "");
+    }
+
+    #[test]
+    fn sniffs_real_formats_by_magic_bytes() {
+        assert_eq!(sniff_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(
+            sniff_image_format(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
+            Some("png")
+        );
+        assert_eq!(sniff_image_format(b"GIF89a..."), Some("gif"));
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(sniff_image_format(&webp), Some("webp"));
+    }
+
+    #[test]
+    fn html_error_page_is_not_sniffed_as_an_image() {
+        let html = b"<!DOCTYPE html><html><body>404 not found</body></html>";
+        assert_eq!(sniff_image_format(html), None);
+    }
+
+    #[test]
+    fn svg_is_recognized_but_rejected_by_download() {
+        assert_eq!(
+            sniff_image_format(b"<?xml version=\"1.0\"?><svg xmlns=\"...\"></svg>"),
+            Some("svg")
+        );
+    }
+
+    #[test]
+    fn write_new_file_refuses_to_overwrite_by_default() {
+        let dir = std::env::temp_dir().join(format!("webseek-img-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.jpg");
+        std::fs::write(&path, b"original").unwrap();
+
+        let err = write_new_file(&path, b"new", false).unwrap_err();
+        assert!(err.to_string().contains("--overwrite"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+
+        write_new_file(&path, b"new", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_file_does_not_follow_a_planted_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("webseek-img-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_target = dir.join("real_secret.txt");
+        std::fs::write(&real_target, b"do not touch").unwrap();
+        let link_path = dir.join("0001_img.jpg");
+        symlink(&real_target, &link_path).unwrap();
+
+        let err = write_new_file(&link_path, b"attacker bytes", false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(std::fs::read(&real_target).unwrap(), b"do not touch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

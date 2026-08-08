@@ -1,15 +1,16 @@
 //! Nominatim (OpenStreetMap) geocoding search (no key, stable JSON).
 //!
-//! Returns places matching a query. Note Nominatim's usage policy: it rejects
-//! non-identifying user agents, so it relies on the browser-like UA set by
-//! `http::build_client`. Keep request volume low (the global `delay` helps).
+//! Returns places matching a query. Nominatim's usage policy requires an
+//! identifying User-Agent *and* an actual contact (email or URL) — see
+//! [`crate::http::build_client`] for the identifying UA; keep request volume
+//! low (the shared rate limiter and global `delay` help with that).
 
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use url::Url;
 
 use crate::engines::SearchEngine;
 use crate::error::{Error, Result};
+use crate::http::Http;
 use crate::models::{SearchOpts, SearchResult};
 
 const SEARCH_URL: &str = "https://nominatim.openstreetmap.org/search";
@@ -53,7 +54,7 @@ impl SearchEngine for Nominatim {
         "nominatim"
     }
 
-    fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
+    fn search(&self, http: &Http, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
         let params: Vec<(&str, &str)> = vec![
             ("q", query),
@@ -63,22 +64,32 @@ impl SearchEngine for Nominatim {
         ];
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&client.get(url))
-            .map_err(|e| Error::Network(format!("nominatim request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body))
+        let body = http.get_text(url, crate::http::MAX_API_BODY_BYTES)?;
+        parse_results(&body.text)
     }
 }
 
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str) -> Vec<SearchResult> {
-    let Ok(places) = serde_json::from_str::<Vec<Place>>(body) else {
-        return Vec::new();
-    };
-    places
+///
+/// The error probe checks the parsed `Value`'s shape (object vs. array)
+/// rather than deserializing straight into an `{ error: ... }` struct:
+/// serde's derive also accepts a *sequence* input for a struct (treating
+/// elements positionally), so a normal single-place `[{...}]` response would
+/// otherwise deserialize its one array element into that struct's one field
+/// and be misread as `{"error": <that place object>}`.
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| Error::Parse(format!("invalid Nominatim API response: {e}")))?;
+    if let Some(err) = value.as_object().and_then(|m| m.get("error")) {
+        let msg = err
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Err(Error::Parse(format!("Nominatim API error: {msg}")));
+    }
+    let places: Vec<Place> = serde_json::from_value(value)
+        .map_err(|e| Error::Parse(format!("invalid Nominatim API response: {e}")))?;
+    Ok(places
         .into_iter()
         .map(|p| {
             let title = if p.display_name.is_empty() {
@@ -92,7 +103,7 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 snippet: format!("{} · {},{}", p.place_type, p.lat, p.lon),
             }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -106,7 +117,7 @@ mod tests {
 
     #[test]
     fn parses_places_with_osm_links() {
-        let r = parse_results(FIXTURE);
+        let r = parse_results(FIXTURE).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "Tokyo, Japan");
         assert_eq!(r[0].url, "https://www.openstreetmap.org/relation/1543125");
@@ -115,7 +126,19 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(parse_results("not json").is_empty());
+    fn malformed_json_is_an_error() {
+        let err = parse_results("not json").unwrap_err();
+        assert_eq!(err.code(), "parse_failed");
+    }
+
+    #[test]
+    fn genuinely_empty_array_is_ok() {
+        assert!(parse_results("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn api_error_object_is_surfaced() {
+        let err = parse_results(r#"{"error":"Something went wrong"}"#).unwrap_err();
+        assert!(err.to_string().contains("Something went wrong"));
     }
 }

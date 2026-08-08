@@ -7,36 +7,89 @@ pub mod cli;
 pub mod config;
 pub mod engines;
 pub mod error;
+pub mod feed;
 pub mod http;
 pub mod models;
+pub mod net;
 pub mod output;
+pub mod ratelimit;
 pub mod reader;
 pub mod region;
 pub mod robots;
 pub mod text;
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
 use clap::Parser;
-use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
-use crate::cli::{Cli, Command};
-use crate::engines::{engine_by_name, image_engine_by_name};
+use crate::cli::{CacheCommand, Cli, Command, ConfigCommand};
 use crate::error::Error;
+use crate::http::Http;
 use crate::models::{FetchOpts, FetchResult, SearchOpts};
-use crate::output::{write_fetch, write_fetch_batch, write_images, write_search, Mode};
+use crate::output::{
+    write_fetch, write_fetch_batch, write_images, write_search, EngineOutcome, Mode,
+};
+use crate::ratelimit::RateLimiter;
 use crate::robots::RobotsChecker;
 
-/// Entry point used by `main.rs`.
-pub fn run() -> Result<()> {
+/// Entry point used by `main.rs`. Returns a real process exit code rather
+/// than relying on `anyhow`'s default `Termination` impl, so usage errors
+/// (2), runtime errors (1), and a downstream reader closing the pipe early
+/// (0 — the standard Unix convention for `SIGPIPE`-like conditions) are all
+/// distinguished.
+pub fn run() -> std::process::ExitCode {
     let cli = Cli::parse();
     let mode = output_mode(&cli);
+    match run_dispatch(&cli, mode) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => finish_with_error(&err, mode, cli.quiet),
+    }
+}
 
-    // `init` must work even when no config exists yet.
+fn finish_with_error(err: &anyhow::Error, mode: Mode, quiet: bool) -> std::process::ExitCode {
+    if is_broken_pipe(err) {
+        return std::process::ExitCode::SUCCESS;
+    }
+    let code = typed_error(err).map(|e| e.exit_code()).unwrap_or(1);
+    if mode != Mode::Pretty {
+        match typed_error(err) {
+            Some(te) => {
+                let _ = output::write_error_json(mode, te);
+            }
+            None => {
+                let envelope = serde_json::json!({
+                    "error": {"code": "internal_error", "message": err.to_string()}
+                });
+                if let Ok(s) = serde_json::to_string(&envelope) {
+                    println!("{s}");
+                }
+            }
+        }
+    }
+    if !quiet {
+        eprintln!("webseek: error: {err}");
+    }
+    std::process::ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .map(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+            .unwrap_or(false)
+    })
+}
+
+fn typed_error(err: &anyhow::Error) -> Option<&Error> {
+    err.chain().find_map(|e| e.downcast_ref::<Error>())
+}
+
+/// Handles the config-free commands (`init`, `engines`, `config path`),
+/// then loads config and dispatches everything else.
+fn run_dispatch(cli: &Cli, mode: Mode) -> anyhow::Result<()> {
     if let Command::Init = &cli.cmd {
         let path = config::Config::write_default(cli.config.as_deref())?;
         if !cli.quiet {
@@ -44,55 +97,144 @@ pub fn run() -> Result<()> {
         }
         return Ok(());
     }
-
-    // `engines` is config-free: list what's available and exit.
     if let Command::Engines = &cli.cmd {
         output::write_engines(mode, &engines::catalog())?;
         return Ok(());
     }
+    if let Command::Config { action } = &cli.cmd {
+        match action {
+            ConfigCommand::Path => {
+                let path = config::Config::effective_path(cli.config.as_deref());
+                output::write_path(mode, "path", &path.display().to_string())?;
+            }
+        }
+        return Ok(());
+    }
 
     let cfg = config::Config::load(cli.config.as_deref())?;
-    config::validate_engine(&cfg.engine)?;
-    config::validate_image_engine(&cfg.image_engine)?;
 
-    let delay = cli.delay.map(Duration::from_millis).unwrap_or(cfg.delay);
-    let timeout = cli.timeout.map(Duration::from_secs).unwrap_or(cfg.timeout);
-    let user_agent = cli.ua.as_deref().unwrap_or(&cfg.user_agent);
-    let client = http::build_client(timeout, user_agent)?;
+    if let Command::Cache { action } = &cli.cmd {
+        let mut cache = build_cache(cli, &cfg);
+        match action {
+            CacheCommand::Info => {
+                output::write_cache_info(mode, &cache.info())?;
+            }
+            CacheCommand::Clear => {
+                let n = cache
+                    .clear()
+                    .map_err(|e| Error::Config(format!("cannot clear cache: {e}")))?;
+                if mode == Mode::Pretty && !cli.quiet {
+                    output::note(&format!(
+                        "cleared {n} cache entr{}",
+                        if n == 1 { "y" } else { "ies" }
+                    ));
+                } else {
+                    output::write_path(mode, "cleared", &n.to_string())?;
+                }
+            }
+        }
+        return Ok(());
+    }
 
-    let cache = Arc::new(Mutex::new(if cli.no_cache || cfg.cache_max_entries == 0 {
-        Cache::disabled()
-    } else {
-        Cache::load(
-            cache::default_cache_path(),
-            cfg.cache_ttl_secs,
-            cfg.cache_max_entries,
-        )
-    }));
-    let robots = Arc::new(Mutex::new(RobotsChecker::new()));
+    let use_color = output::resolve_color(cli.color);
+    let http = build_http(cli, &cfg)?;
+    let cache = Arc::new(Mutex::new(build_cache(cli, &cfg)));
+    let robots = Arc::new(RobotsChecker::new());
 
-    let outcome = run_inner(&cli, &cfg, &client, &mode, &cache, &robots, delay);
-    if let Ok(c) = cache.lock() {
+    let outcome = run_command(cli, &cfg, &http, mode, use_color, &cache, &robots);
+    if let Ok(mut c) = cache.lock() {
         c.save(); // best-effort, even when the command failed
     }
     outcome
 }
 
+fn build_cache(cli: &Cli, cfg: &config::Config) -> Cache {
+    let enabled = if cli.no_cache {
+        false
+    } else {
+        cli.cache || cfg.cache_max_entries > 0
+    };
+    if !enabled {
+        Cache::disabled()
+    } else {
+        Cache::load(
+            cache::default_cache_path(),
+            cfg.cache_ttl_secs,
+            cfg.cache_max_entries.max(1),
+            cfg.cache_max_bytes,
+        )
+    }
+}
+
+fn build_http(cli: &Cli, cfg: &config::Config) -> crate::error::Result<Http> {
+    let policy = net::EgressPolicy {
+        allow_private: cli.allow_private || cfg.allow_private_network,
+    };
+    let allow_proxy = !cli.no_proxy && cfg.allow_proxy;
+    // A proxy resolves the destination itself, so the private-network/
+    // DNS-rebinding checks below can't see the real target for that hop.
+    // Only worth mentioning when that guard is actually doing something —
+    // if the caller already opted into --allow-private, there's nothing a
+    // proxy could additionally bypass.
+    if allow_proxy && !policy.allow_private && !cli.quiet {
+        if let Some(var) = net::active_proxy_env() {
+            output::note(&format!(
+                "${var} is set: requests may go through a proxy, which resolves the \
+                 destination itself — the private-network/DNS-rebinding egress checks \
+                 cannot see or block the real target for proxied requests. Pass \
+                 --no-proxy for the strongest guarantee if you don't need the proxy."
+            ));
+        }
+    }
+    let timeout = cli.timeout.map(Duration::from_secs).unwrap_or(cfg.timeout);
+    let user_agent = cli.ua.clone().unwrap_or_else(|| cfg.user_agent.clone());
+    let accept_language = http::accept_language_for(cfg.lang.as_deref());
+    let client = http::build_client(timeout, &user_agent, &accept_language, policy, allow_proxy)?;
+    let delay = cli.delay.map(Duration::from_millis).unwrap_or(cfg.delay);
+    let limiter = Arc::new(RateLimiter::new(delay));
+    Ok(Http::new(client, limiter, policy))
+}
+
+fn resolve_bool(explicit_true: bool, explicit_false: bool, config_default: bool) -> bool {
+    if explicit_false {
+        false
+    } else if explicit_true {
+        true
+    } else {
+        config_default
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_inner(
+fn run_command(
     cli: &Cli,
     cfg: &config::Config,
-    client: &Client,
-    mode: &Mode,
+    http: &Http,
+    mode: Mode,
+    use_color: bool,
     cache: &Arc<Mutex<Cache>>,
-    robots: &Arc<Mutex<RobotsChecker>>,
-    delay: Duration,
-) -> Result<()> {
-    let respect_robots = cfg.respect_robots || cli.respect_robots;
+    robots: &Arc<RobotsChecker>,
+) -> anyhow::Result<()> {
+    let verbose = cli.verbose && !cli.quiet;
+    let respect_robots = if cli.ignore_robots {
+        false
+    } else if cli.respect_robots {
+        true
+    } else {
+        cfg.respect_robots
+    };
+    let fallback = if cli.no_fallback {
+        false
+    } else if cli.fallback {
+        true
+    } else {
+        cfg.fallback
+    };
 
     match &cli.cmd {
-        Command::Init => unreachable!("handled above"),
-        Command::Engines => unreachable!("handled above"),
+        Command::Init | Command::Engines | Command::Config { .. } | Command::Cache { .. } => {
+            unreachable!("handled in run_dispatch")
+        }
         Command::Search {
             query,
             count,
@@ -100,33 +242,34 @@ fn run_inner(
             lang,
             region,
             safe,
+            no_safe,
             open,
         } => {
-            let name = engine.as_deref().unwrap_or(&cfg.engine);
+            let requested = engine.as_deref().unwrap_or(&cfg.engine);
+            engines::validate_engine(requested)?;
+            let canonical = engines::canonical_name(requested).expect("validated above");
             let opts = SearchOpts {
-                count: (*count).clamp(1, 50),
+                count: count.unwrap_or(cfg.max_results).clamp(1, 50),
                 lang: lang.clone().or_else(|| cfg.lang.clone()),
                 region: region.clone().or_else(|| cfg.region.clone()),
-                safe: *safe || cfg.safe_search,
+                safe: resolve_bool(*safe, *no_safe, cfg.safe_search),
             };
-            if cli.verbose && !cli.quiet {
-                output::note(&format!("searching '{query}' via {name}"));
+            if verbose {
+                output::note(&format!("searching '{query}' via {canonical}"));
             }
-            let (results, engine_used) =
-                search_with_cache(client, name, query, &opts, cache, cli, cfg)?;
+            let (results, eo) =
+                search_with_cache(http, canonical, query, &opts, cache, fallback, verbose)?;
             if let Some(idx) = open {
                 let i = idx
                     .checked_sub(1)
-                    .ok_or_else(|| Error::Config("--open index must be >= 1".to_string()))?;
+                    .ok_or_else(|| Error::Usage("--open index must be >= 1".to_string()))?;
                 let target = results.get(i).ok_or_else(|| {
                     Error::NoResults(format!("no result #{idx} (only {} found)", results.len()))
                 })?;
-                open::that(&target.url)
-                    .map_err(|e| Error::Network(format!("cannot open browser: {e}")))?;
+                open_result_url(&target.url, cli.allow_external_schemes)?;
                 return Ok(());
             }
-            write_search(*mode, query, engine_used, &results)?;
-            pause(delay, cli);
+            write_search(mode, use_color, query, &eo, &results)?;
             Ok(())
         }
         Command::Fetch {
@@ -135,55 +278,60 @@ fn run_inner(
             markdown,
             html,
             jobs,
+            fail_on_any_error,
+            fail_if_all_error,
             open,
         } => {
             if *open {
                 if urls.len() != 1 {
-                    return Err(Error::Config("--open requires exactly one URL".to_string()).into());
+                    return Err(Error::Usage("--open requires exactly one URL".to_string()).into());
                 }
-                open::that(&urls[0])
-                    .map_err(|e| Error::Network(format!("cannot open browser: {e}")))?;
+                open_result_url(&urls[0], cli.allow_external_schemes)?;
                 return Ok(());
             }
             let opts = FetchOpts {
                 max_bytes: reader::DEFAULT_MAX_BYTES,
-                max_chars: *max_chars,
+                max_chars: max_chars.unwrap_or(cfg.max_chars),
                 raw_html: *html,
                 markdown: *markdown,
             };
 
             if urls.len() == 1 {
                 fetch_single(
-                    client,
+                    http,
                     &urls[0],
                     &opts,
                     mode,
+                    use_color,
                     cache,
                     robots,
                     respect_robots,
-                    cli,
+                    verbose,
                 )?;
             } else {
-                if cli.verbose && !cli.quiet {
+                // More workers than URLs would just spin without work; the
+                // CLI parser already enforces jobs <= 64.
+                let jobs = jobs.map(|j| j as usize).unwrap_or(1).clamp(1, urls.len());
+                if verbose {
                     output::note(&format!(
-                        "fetching {} URLs with {} worker(s)",
-                        urls.len(),
-                        (*jobs).max(1)
+                        "fetching {} URLs with {jobs} worker(s)",
+                        urls.len()
                     ));
                 }
-                let items = batch::fetch_many(
-                    client,
-                    urls,
-                    &opts,
-                    *jobs,
-                    delay,
-                    cache,
-                    robots,
-                    respect_robots,
-                );
-                write_fetch_batch(*mode, &items)?;
+                let items =
+                    batch::fetch_many(http, urls, &opts, jobs, cache, robots, respect_robots);
+                write_fetch_batch(mode, use_color, &items)?;
+                let failed = items
+                    .iter()
+                    .filter(|it| matches!(it, batch::BatchItem::Err { .. }))
+                    .count();
+                if *fail_on_any_error && failed > 0 {
+                    anyhow::bail!("{failed} of {} URLs failed", items.len());
+                }
+                if *fail_if_all_error && !items.is_empty() && failed == items.len() {
+                    anyhow::bail!("all {failed} URLs failed");
+                }
             }
-            pause(delay, cli);
             Ok(())
         }
         Command::Images {
@@ -194,59 +342,64 @@ fn run_inner(
             limit,
             max_bytes,
             safe,
+            no_safe,
+            overwrite,
         } => {
-            let name = engine.as_deref().unwrap_or(&cfg.image_engine);
-            if cli.verbose && !cli.quiet {
-                output::note(&format!("searching images for '{query}' via {name}"));
+            let requested = engine.as_deref().unwrap_or(&cfg.image_engine);
+            engines::validate_image_engine(requested)?;
+            let canonical = engines::canonical_image_name(requested).expect("validated above");
+            let count = count.unwrap_or(cfg.max_results).clamp(1, 50);
+            let safe = resolve_bool(*safe, *no_safe, cfg.safe_search);
+            if verbose {
+                output::note(&format!("searching images for '{query}' via {canonical}"));
             }
-            let (results, engine_used) = images_with_cache(
-                client,
-                name,
-                query,
-                (*count).clamp(1, 50),
-                *safe || cfg.safe_search,
-                cache,
-                cli,
-                cfg,
+            let (results, eo) = images_with_cache(
+                http, canonical, query, count, safe, cache, fallback, verbose,
             )?;
+            let overwrite = *overwrite || cfg.image_overwrite;
             let downloaded = match download {
                 Some(dir) => Some(engines::images::download(
-                    client,
+                    http,
                     &results,
                     dir,
                     limit.unwrap_or(results.len()),
                     max_bytes.unwrap_or(cfg.image_max_bytes),
+                    overwrite,
                 )?),
                 None => None,
             };
-            write_images(*mode, query, engine_used, &results, downloaded)?;
-            pause(delay, cli);
+            write_images(mode, use_color, query, &eo, &results, downloaded)?;
             Ok(())
         }
     }
+}
+
+fn open_result_url(raw: &str, allow_external_schemes: bool) -> crate::error::Result<()> {
+    let url =
+        url::Url::parse(raw).map_err(|e| Error::Config(format!("invalid URL '{raw}': {e}")))?;
+    net::check_open_url(&url, allow_external_schemes)?;
+    open::that(raw).map_err(|e| Error::Network(format!("cannot open browser: {e}")))
 }
 
 /// Single-URL fetch honoring cache and (optionally) robots.txt. Keeps the
 /// established single-object JSON contract.
 #[allow(clippy::too_many_arguments)]
 fn fetch_single(
-    client: &Client,
+    http: &Http,
     url: &str,
     opts: &FetchOpts,
-    mode: &Mode,
+    mode: Mode,
+    use_color: bool,
     cache: &Arc<Mutex<Cache>>,
-    robots: &Arc<Mutex<RobotsChecker>>,
+    robots: &Arc<RobotsChecker>,
     respect_robots: bool,
-    cli: &Cli,
-) -> Result<()> {
+    verbose: bool,
+) -> anyhow::Result<()> {
     if respect_robots {
-        let allowed = match robots.lock() {
-            Ok(mut c) => c.is_allowed(client, url).unwrap_or(true),
-            Err(_) => true,
-        };
+        let allowed = robots.is_allowed(http, url).unwrap_or(true);
         if !allowed {
             return Err(Error::Network(format!(
-                "blocked by robots.txt: {url} (use --respect-robots off to override)"
+                "blocked by robots.txt: {url} (use --ignore-robots to override)"
             ))
             .into());
         }
@@ -258,180 +411,229 @@ fn fetch_single(
         &opts.raw_html.to_string(),
         &opts.markdown.to_string(),
     ]);
-    if let Some(v) = cache.lock().ok().and_then(|c| c.get(&key)) {
-        if let Ok(fetched) = serde_json::from_value::<FetchResult>(v) {
-            if cli.verbose && !cli.quiet {
-                output::note(&format!("{url} (cache hit)"));
+    if let Some(v) = cache.lock().ok().and_then(|mut c| c.get(&key)) {
+        match serde_json::from_value::<FetchResult>(v) {
+            Ok(fetched) => {
+                if verbose {
+                    output::note(&format!("{url} (cache hit)"));
+                }
+                write_fetch(mode, use_color, &fetched)?;
+                return Ok(());
             }
-            write_fetch(*mode, &fetched)?;
-            return Ok(());
+            Err(_) => {
+                // Corrupt/stale entry: drop and refetch, same as batch mode.
+                if let Ok(mut c) = cache.lock() {
+                    c.remove(&key);
+                }
+            }
         }
     }
-    if cli.verbose && !cli.quiet {
+    if verbose {
         output::note(&format!("fetching {url}"));
     }
-    let fetched = reader::fetch(client, url, opts)?;
+    let fetched = reader::fetch(http, url, opts)?;
     if let Ok(mut c) = cache.lock() {
         if let Ok(v) = serde_json::to_value(&fetched) {
             c.put(key, v);
         }
     }
-    write_fetch(*mode, &fetched)?;
+    write_fetch(mode, use_color, &fetched)?;
     Ok(())
 }
 
-/// Search honoring the cache, with automatic engine fallback.
-#[allow(clippy::too_many_arguments)]
+/// What gets cached for a search: the results *and* which engine actually
+/// produced them, so a cache hit can still correctly report a fallback that
+/// happened before the entry was written.
+#[derive(Serialize, Deserialize)]
+struct CachedSearch {
+    engine_used: String,
+    results: Vec<crate::models::SearchResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedImages {
+    engine_used: String,
+    results: Vec<crate::models::ImageResult>,
+}
+
+/// Search honoring the cache, with automatic same-capability engine fallback.
+///
+/// A successful fallback is cached under *both* the originally requested
+/// engine's key and the engine that actually answered — previously only the
+/// latter was written, so the next call for the original engine repeated the
+/// failing request before falling back again every single time.
 fn search_with_cache(
-    client: &Client,
-    name: &str,
+    http: &Http,
+    canonical: &'static str,
     query: &str,
     opts: &SearchOpts,
     cache: &Arc<Mutex<Cache>>,
-    cli: &Cli,
-    cfg: &config::Config,
-) -> Result<(Vec<crate::models::SearchResult>, &'static str)> {
-    let key = crate::cache::cache_key(&[
-        "search",
-        name,
-        query,
-        &opts.count.to_string(),
-        opts.lang.as_deref().unwrap_or(""),
-        opts.region.as_deref().unwrap_or(""),
-        &opts.safe.to_string(),
-    ]);
-    if let Some(v) = cache.lock().ok().and_then(|c| c.get(&key)) {
-        if let Ok(results) = serde_json::from_value::<Vec<crate::models::SearchResult>>(v) {
-            if cli.verbose && !cli.quiet {
-                output::note(&format!("{name} results (cache hit)"));
-            }
-            return Ok((results, engine_by_name(name)?.name()));
+    fallback_enabled: bool,
+    verbose: bool,
+) -> anyhow::Result<(Vec<crate::models::SearchResult>, EngineOutcome)> {
+    let key_for = |engine: &str| {
+        crate::cache::cache_key(&[
+            "search",
+            engine,
+            query,
+            &opts.count.to_string(),
+            opts.lang.as_deref().unwrap_or(""),
+            opts.region.as_deref().unwrap_or(""),
+            &opts.safe.to_string(),
+        ])
+    };
+    let requested_key = key_for(canonical);
+    if let Some(v) = cache.lock().ok().and_then(|mut c| c.get(&requested_key)) {
+        if let Ok(cached) = serde_json::from_value::<CachedSearch>(v) {
+            return Ok((
+                cached.results,
+                EngineOutcome {
+                    requested: canonical.to_string(),
+                    used: cached.engine_used,
+                    cache_hit: true,
+                },
+            ));
         }
     }
-    let fallback = cfg.fallback && !cli.no_fallback;
-    // Validate the requested engine first: an unknown name is a config error
-    // and must surface as-is (no silent fallback).
-    engine_by_name(name)?;
-    let order = if fallback {
-        engines::fallback_order(name, engines::TEXT_ENGINES)
+
+    let order = if fallback_enabled {
+        engines::fallback_order(canonical)
     } else {
-        vec![name]
+        Vec::new()
     };
+    let order: Vec<&str> = if order.is_empty() {
+        vec![canonical]
+    } else {
+        order
+    };
+
     let mut last_err: Option<Error> = None;
-    let mut outcome: Option<(Vec<crate::models::SearchResult>, &'static str)> = None;
     for eng_name in order {
-        let eng = engine_by_name(eng_name)?;
-        match eng.search(client, query, opts) {
-            Ok(r) => {
-                outcome = Some((r, eng.name()));
-                break;
+        let eng = engines::engine_by_name(eng_name)?;
+        match eng.search(http, query, opts) {
+            Ok(results) => {
+                let used = eng.name();
+                let envelope = CachedSearch {
+                    engine_used: used.to_string(),
+                    results: results.clone(),
+                };
+                if let Ok(v) = serde_json::to_value(&envelope) {
+                    if let Ok(mut c) = cache.lock() {
+                        c.put(requested_key, v.clone());
+                        if used != canonical {
+                            c.put(key_for(used), v);
+                        }
+                    }
+                }
+                return Ok((
+                    results,
+                    EngineOutcome {
+                        requested: canonical.to_string(),
+                        used: used.to_string(),
+                        cache_hit: false,
+                    },
+                ));
             }
             Err(e) => {
-                let retryable = matches!(
-                    e,
-                    Error::RateLimited(_) | Error::Network(_) | Error::Parse(_) | Error::Http(_)
-                );
-                if !retryable {
+                if !e.is_retryable() {
                     return Err(e.into());
                 }
-                if cli.verbose && !cli.quiet {
+                if verbose {
                     output::note(&format!("{eng_name} failed ({e})"));
                 }
                 last_err = Some(e);
             }
         }
     }
-    let (results, engine_used) = match outcome {
-        Some(o) => o,
-        None => return Err(last_err.expect("engine order is non-empty").into()),
-    };
-    if let Ok(mut c) = cache.lock() {
-        if let Ok(v) = serde_json::to_value(&results) {
-            let hit_key = crate::cache::cache_key(&[
-                "search",
-                engine_used,
-                query,
-                &opts.count.to_string(),
-                opts.lang.as_deref().unwrap_or(""),
-                opts.region.as_deref().unwrap_or(""),
-                &opts.safe.to_string(),
-            ]);
-            c.put(hit_key, v);
-        }
-    }
-    Ok((results, engine_used))
+    Err(last_err.expect("engine order is non-empty").into())
 }
 
-/// Image search honoring the cache, with automatic engine fallback.
+/// Image search honoring the cache, with automatic engine fallback. Mirrors
+/// [`search_with_cache`]'s dual-key caching.
 #[allow(clippy::too_many_arguments)]
 fn images_with_cache(
-    client: &Client,
-    name: &str,
+    http: &Http,
+    canonical: &'static str,
     query: &str,
     count: usize,
     safe: bool,
     cache: &Arc<Mutex<Cache>>,
-    cli: &Cli,
-    cfg: &config::Config,
-) -> Result<(Vec<crate::models::ImageResult>, &'static str)> {
-    let key =
-        crate::cache::cache_key(&["images", name, query, &count.to_string(), &safe.to_string()]);
-    if let Some(v) = cache.lock().ok().and_then(|c| c.get(&key)) {
-        if let Ok(results) = serde_json::from_value::<Vec<crate::models::ImageResult>>(v) {
-            if cli.verbose && !cli.quiet {
-                output::note(&format!("{name} image results (cache hit)"));
-            }
-            return Ok((results, image_engine_by_name(name)?.name()));
+    fallback_enabled: bool,
+    verbose: bool,
+) -> anyhow::Result<(Vec<crate::models::ImageResult>, EngineOutcome)> {
+    let key_for = |engine: &str| {
+        crate::cache::cache_key(&[
+            "images",
+            engine,
+            query,
+            &count.to_string(),
+            &safe.to_string(),
+        ])
+    };
+    let requested_key = key_for(canonical);
+    if let Some(v) = cache.lock().ok().and_then(|mut c| c.get(&requested_key)) {
+        if let Ok(cached) = serde_json::from_value::<CachedImages>(v) {
+            return Ok((
+                cached.results,
+                EngineOutcome {
+                    requested: canonical.to_string(),
+                    used: cached.engine_used,
+                    cache_hit: true,
+                },
+            ));
         }
     }
-    let fallback = cfg.fallback && !cli.no_fallback;
-    image_engine_by_name(name)?;
-    let order = if fallback {
-        engines::fallback_order(name, engines::IMAGE_ENGINES)
+
+    let order = if fallback_enabled {
+        engines::fallback_order_images(canonical)
     } else {
-        vec![name]
+        Vec::new()
     };
+    let order: Vec<&str> = if order.is_empty() {
+        vec![canonical]
+    } else {
+        order
+    };
+
     let mut last_err: Option<Error> = None;
-    let mut outcome: Option<(Vec<crate::models::ImageResult>, &'static str)> = None;
     for eng_name in order {
-        let eng = image_engine_by_name(eng_name)?;
-        match eng.search(client, query, count, safe) {
-            Ok(r) => {
-                outcome = Some((r, eng.name()));
-                break;
+        let eng = engines::image_engine_by_name(eng_name)?;
+        match eng.search(http, query, count, safe) {
+            Ok(results) => {
+                let used = eng.name();
+                let envelope = CachedImages {
+                    engine_used: used.to_string(),
+                    results: results.clone(),
+                };
+                if let Ok(v) = serde_json::to_value(&envelope) {
+                    if let Ok(mut c) = cache.lock() {
+                        c.put(requested_key, v.clone());
+                        if used != canonical {
+                            c.put(key_for(used), v);
+                        }
+                    }
+                }
+                return Ok((
+                    results,
+                    EngineOutcome {
+                        requested: canonical.to_string(),
+                        used: used.to_string(),
+                        cache_hit: false,
+                    },
+                ));
             }
             Err(e) => {
-                let retryable = matches!(
-                    e,
-                    Error::RateLimited(_) | Error::Network(_) | Error::Parse(_) | Error::Http(_)
-                );
-                if !retryable {
+                if !e.is_retryable() {
                     return Err(e.into());
                 }
-                if cli.verbose && !cli.quiet {
+                if verbose {
                     output::note(&format!("{eng_name} failed ({e})"));
                 }
                 last_err = Some(e);
             }
         }
     }
-    let (results, engine_used) = match outcome {
-        Some(o) => o,
-        None => return Err(last_err.expect("engine order is non-empty").into()),
-    };
-    if let Ok(mut c) = cache.lock() {
-        if let Ok(v) = serde_json::to_value(&results) {
-            let hit_key = crate::cache::cache_key(&[
-                "images",
-                engine_used,
-                query,
-                &count.to_string(),
-                &safe.to_string(),
-            ]);
-            c.put(hit_key, v);
-        }
-    }
-    Ok((results, engine_used))
+    Err(last_err.expect("engine order is non-empty").into())
 }
 
 fn output_mode(cli: &Cli) -> Mode {
@@ -443,12 +645,5 @@ fn output_mode(cli: &Cli) -> Mode {
         Mode::Pretty
     } else {
         Mode::auto()
-    }
-}
-
-/// Gentleness: keep a pause between upstream requests unless disabled.
-fn pause(delay: Duration, cli: &Cli) {
-    if !delay.is_zero() && !cli.quiet {
-        thread::sleep(delay);
     }
 }

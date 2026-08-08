@@ -62,9 +62,19 @@ try {
     Move-Item -Path $Binary -Destination $Destination -Force
 
     # --- Add to user PATH if missing -------------------------------------------
+    # Compare normalized (fully-resolved, trailing-separator-trimmed) paths:
+    # a raw string comparison treats "...\webseek\bin" and "...\webseek\bin\"
+    # (or a relative/env-var form of the same path) as different entries and
+    # appends a duplicate every time the installer re-runs.
+    function Get-NormalizedPath([string]$Path) {
+        try { [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
+        catch { $Path.TrimEnd('\', '/') }
+    }
     $CurrentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $Dirs = @($CurrentPath -split ';' | Where-Object { $_ })
-    if ($Dirs -notcontains $InstallDir) {
+    $NormalizedInstallDir = Get-NormalizedPath $InstallDir
+    $NormalizedDirs = @($Dirs | ForEach-Object { Get-NormalizedPath $_ })
+    if ($NormalizedDirs -notcontains $NormalizedInstallDir) {
         [Environment]::SetEnvironmentVariable('Path', (($Dirs + $InstallDir) -join ';'), 'User')
         Write-Host "Added $InstallDir to your user PATH (restart your shell to use it)"
     }

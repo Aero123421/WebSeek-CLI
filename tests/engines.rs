@@ -14,6 +14,7 @@ use webseek::engines::bing::Bing;
 use webseek::engines::duckduckgo::DuckDuckGo;
 use webseek::engines::images::{BingImages, DuckDuckGoImages};
 use webseek::engines::{ImageEngine, SearchEngine};
+use webseek::http::Http;
 use webseek::models::SearchOpts;
 
 const DDG_HTML: &str = r#"<html><body>
@@ -44,12 +45,15 @@ const DDG_IMAGES_JSON: &str = r#"{"results":[
   {"image":"https://cdn.example.com/ddg.jpg","title":"DDG pic","url":"https://page.example.com/ddg","width":100,"height":200}
 ]}"#;
 
-fn client() -> Client {
-    Client::builder()
+fn http() -> Http {
+    let client = Client::builder()
         .user_agent("webseek-test")
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap()
+        .unwrap();
+    // Mock servers run on loopback; `for_tests` uses a permissive egress
+    // policy so the SSRF guard doesn't reject 127.0.0.1 in tests.
+    Http::for_tests(client)
 }
 
 fn opts() -> SearchOpts {
@@ -84,7 +88,7 @@ fn duckduckgo_engine_full_pipeline() {
     let base = format!("{}/html/", server.uri());
 
     let engine = DuckDuckGo::with_base(base);
-    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let results = engine.search(&http(), "rust", &opts()).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].title, "First hit");
@@ -107,7 +111,7 @@ fn duckduckgo_engine_count_and_ratelimit() {
     let base = format!("{}/html/", server.uri());
 
     let engine = DuckDuckGo::with_base(base);
-    let err = engine.search(&client(), "rust", &opts()).unwrap_err();
+    let err = engine.search(&http(), "rust", &opts()).unwrap_err();
     assert!(
         err.to_string().contains("rate-limited"),
         "unexpected error: {err}"
@@ -129,7 +133,7 @@ fn bing_engine_full_pipeline() {
     let base = format!("{}/search", server.uri());
 
     let engine = Bing::with_base(base);
-    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let results = engine.search(&http(), "rust", &opts()).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].title, "Bing hit one");
@@ -152,7 +156,7 @@ fn bing_images_engine_full_pipeline() {
     let base = format!("{}/images/search", server.uri());
 
     let engine = BingImages::with_base(base);
-    let results = engine.search(&client(), "cats", 5, false).unwrap();
+    let results = engine.search(&http(), "cats", 5, false).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].url, "https://cdn.example.com/pic.jpg");
@@ -183,7 +187,7 @@ fn duckduckgo_images_engine_full_pipeline() {
     let page_base = server.uri();
 
     let engine = DuckDuckGoImages::with_bases(page_base, json_base);
-    let results = engine.search(&client(), "cats", 5, false).unwrap();
+    let results = engine.search(&http(), "cats", 5, false).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].url, "https://cdn.example.com/ddg.jpg");
@@ -229,7 +233,7 @@ fn bing_engine_prefers_rss_endpoint() {
     let base = format!("{}/search", server.uri());
 
     let engine = Bing::with_base(base);
-    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let results = engine.search(&http(), "rust", &opts()).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].title, "RSS hit one");
@@ -259,7 +263,7 @@ fn search_recovers_after_transient_500_via_retry() {
     let base = format!("{}/html/", server.uri());
 
     let engine = DuckDuckGo::with_base(base);
-    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let results = engine.search(&http(), "rust", &opts()).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].url, "https://example.com/1");
