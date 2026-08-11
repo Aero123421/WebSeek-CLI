@@ -106,7 +106,7 @@ impl Default for TomlConfig {
             cache_max_entries: 1000,
             fallback: true,
             respect_robots: false,
-            image_max_bytes: 5 * 1024 * 1024,
+            image_max_bytes: crate::engines::images::DEFAULT_MAX_IMAGE_BYTES,
         }
     }
 }

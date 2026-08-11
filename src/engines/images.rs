@@ -23,7 +23,8 @@ use crate::pace::Pacer;
 use crate::robots::RobotsChecker;
 use crate::text::sanitize_name;
 
-/// Default cap for downloaded images when `--max-bytes` is not given.
+/// Default cap for downloaded images, and the default for the config's
+/// `image_max_bytes`. One constant so the two cannot drift apart.
 pub const DEFAULT_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 pub struct BingImages {

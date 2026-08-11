@@ -36,11 +36,15 @@ impl Cli {
 
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("webseek").unwrap();
-        // Isolate every platform's config/cache discovery.
+        // Isolate config/cache discovery on every platform: Linux reads the
+        // XDG vars, macOS derives both from HOME, and Windows uses APPDATA for
+        // config and LOCALAPPDATA for the cache. Miss one and the tests share
+        // the developer's real cache, which makes them order-dependent.
         c.env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_CACHE_HOME", self.home.path().join("cache"))
             .env("APPDATA", self.home.path().join("appdata"))
+            .env("LOCALAPPDATA", self.home.path().join("localappdata"))
             .env_remove("WEBSEEK_CONFIG")
             .env_remove("NO_COLOR")
             .env("RUST_BACKTRACE", "0");
