@@ -2,7 +2,12 @@
 name = "webseek"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+# Verified in CI by building the binary with exactly this toolchain. The
+# previously declared 1.75 was never checked and had not been true for some
+# time (the `url` -> `idna_adapter` -> `icu_*` chain alone needs 1.86).
+# Running the *test suite* needs a newer toolchain than this, because the
+# `wiremock` dev-dependency uses let-chains; that does not affect users.
+rust-version = "1.86"
 description = "API-key-free web search & page fetch CLI designed for AI agents"
 license = "MIT"
 keywords = ["search", "cli", "web", "agent", "scrape"]
