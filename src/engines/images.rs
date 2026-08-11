@@ -7,16 +7,20 @@
 //!
 //! Both parsers are pure functions, unit-tested with fixtures.
 
+use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
 
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use url::Url;
 
-use crate::engines::{dedupe_by_url, ImageEngine};
+use crate::engines::{dedupe_and_truncate, ImageEngine};
 use crate::error::{Error, Result};
 use crate::models::ImageResult;
+use crate::pace::Pacer;
+use crate::robots::RobotsChecker;
 use crate::text::sanitize_name;
 
 /// Default cap for downloaded images when `--max-bytes` is not given.
@@ -90,13 +94,26 @@ impl ImageEngine for BingImages {
 
         let resp = crate::http::send_with_retry(&client.get(url))
             .map_err(|e| Error::Network(format!("bing images request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
+        let status = resp.status();
+        if matches!(status.as_u16(), 202 | 403 | 429) {
+            return Err(Error::RateLimited(format!(
+                "bing images answered HTTP {status} (retry later or lower request rate)"
+            )));
+        }
+        if !status.is_success() {
+            return Err(Error::Http(status.as_u16()));
         }
         let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_bing_html(&body);
-        results.truncate(count);
-        Ok(dedupe_by_url(results, |r| &r.url))
+        // Without this the text engine reported challenges but the image
+        // engine silently returned zero results, so fallback never fired.
+        if crate::engines::looks_like_challenge(&body) {
+            return Err(Error::RateLimited(
+                "bing images served a bot-challenge page instead of results".into(),
+            ));
+        }
+        Ok(dedupe_and_truncate(parse_bing_html(&body), count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -132,9 +149,9 @@ impl ImageEngine for DuckDuckGoImages {
             return Err(Error::Http(status.as_u16()));
         }
         let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_ddg_json(&body)?;
-        results.truncate(count);
-        Ok(dedupe_by_url(results, |r| &r.url))
+        Ok(dedupe_and_truncate(parse_ddg_json(&body)?, count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -277,63 +294,145 @@ fn format_from_url(url: &str) -> String {
     }
 }
 
-/// Download image results into `dir`, `limit` at most, skipping anything
-/// larger than `max_bytes`. Returns saved paths.
-pub fn download(
-    client: &Client,
-    results: &[ImageResult],
-    dir: &Path,
-    limit: usize,
-    max_bytes: usize,
-) -> Result<Vec<String>> {
+/// Everything [`download`] needs beyond the results themselves.
+pub struct DownloadCtx<'a> {
+    pub client: &'a Client,
+    /// Shared politeness limiter; downloads are upstream requests too.
+    pub pacer: &'a Pacer,
+    /// Consulted when `--respect-robots` is on, exactly like page fetches.
+    pub robots: Option<&'a Mutex<RobotsChecker>>,
+    pub limit: usize,
+    pub max_bytes: usize,
+}
+
+/// Download image results into `dir`, at most `ctx.limit` of them, skipping
+/// anything larger than `ctx.max_bytes`. Returns saved paths.
+///
+/// Notes on the request pattern, which used to be neither gentle nor safe:
+/// - **One request per image.** The size pre-check is a `HEAD`, and falls back
+///   to the streaming cap when a server does not support it — the old code
+///   issued a throwaway `GET` and then a second `GET` for the same file.
+/// - **Bounded in memory.** The body is streamed with a hard cap instead of
+///   being buffered in full and measured afterwards.
+/// - **Paced.** Downloads go through the same limiter as every other request.
+/// - **Per-file failures are skipped**, not fatal: one unwritable name must
+///   not discard the images that already downloaded successfully.
+pub fn download(ctx: &DownloadCtx<'_>, results: &[ImageResult], dir: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::Config(format!("cannot create download dir {}: {e}", dir.display())))?;
+
     let mut saved = Vec::new();
-    for (i, img) in results.iter().take(limit).enumerate() {
-        // Skip by Content-Length before downloading when possible.
-        if let Some(len) = client
-            .get(&img.url)
-            .send()
-            .ok()
-            .and_then(|r| r.content_length())
-        {
-            if len > max_bytes as u64 {
-                eprintln!(
-                    "[webseek] skipping {} ({} bytes > {} byte limit)",
-                    img.url, len, max_bytes
-                );
+    for (i, img) in results.iter().take(ctx.limit).enumerate() {
+        if let Some(robots) = ctx.robots {
+            let allowed = match robots.lock() {
+                Ok(mut c) => c
+                    .is_allowed(ctx.client, ctx.pacer, &img.url)
+                    .unwrap_or(true),
+                Err(_) => true,
+            };
+            if !allowed {
+                crate::output::warn(&format!("skipping {} (robots.txt)", img.url));
                 continue;
             }
         }
-        let resp = client
-            .get(&img.url)
-            .send()
-            .map_err(|e| Error::Network(format!("download {} failed: {e}", img.url)))?;
-        if !resp.status().is_success() {
-            continue; // skip dead links, keep going
+
+        // Cheap size pre-check. A server that rejects HEAD just means we rely
+        // on the streaming cap below instead of paying for a second request.
+        ctx.pacer.wait();
+        if let Ok(head) = ctx.client.head(&img.url).send() {
+            if head.status().is_success() {
+                if let Some(len) = head.content_length() {
+                    if len > ctx.max_bytes as u64 {
+                        crate::output::warn(&format!(
+                            "skipping {} ({len} bytes > {} byte limit)",
+                            img.url, ctx.max_bytes
+                        ));
+                        continue;
+                    }
+                }
+            }
         }
-        let bytes = resp.bytes().map_err(Error::from)?;
-        if bytes.len() > max_bytes {
-            eprintln!(
-                "[webseek] skipping {} ({} bytes > {} byte limit)",
-                img.url,
-                bytes.len(),
-                max_bytes
-            );
+
+        ctx.pacer.wait();
+        let resp = match ctx.client.get(&img.url).send() {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                crate::output::warn(&format!("skipping {} (HTTP {})", img.url, r.status()));
+                continue;
+            }
+            Err(e) => {
+                crate::output::warn(&format!("skipping {} ({e})", img.url));
+                continue;
+            }
+        };
+
+        let ext = extension_for(img, &resp);
+
+        // Read one byte past the limit so an oversized body is detected
+        // without ever holding more than the cap in memory.
+        let mut bytes = Vec::new();
+        let read = resp
+            .take(ctx.max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_ok();
+        if !read {
+            crate::output::warn(&format!("skipping {} (read failed)", img.url));
             continue;
         }
-        let ext = if img.format.is_empty() {
-            "img"
-        } else {
-            &img.format
-        };
+        if bytes.len() > ctx.max_bytes {
+            crate::output::warn(&format!(
+                "skipping {} (larger than the {} byte limit)",
+                img.url, ctx.max_bytes
+            ));
+            continue;
+        }
+
         let name = sanitize_name(&img.title);
         let filename = dir.join(format!("{:04}_{name}.{ext}", i + 1));
-        std::fs::write(&filename, &bytes)
-            .map_err(|e| Error::Network(format!("cannot write {}: {e}", filename.display())))?;
+        if let Err(e) = std::fs::write(&filename, &bytes) {
+            crate::output::warn(&format!("cannot write {}: {e}", filename.display()));
+            continue;
+        }
         saved.push(filename.display().to_string());
     }
     Ok(saved)
+}
+
+/// File extension for a downloaded image: the URL's, else the `Content-Type`.
+///
+/// URLs that route through a redirector carry no extension, and a file called
+/// `.img` opens in nothing.
+fn extension_for(img: &ImageResult, resp: &reqwest::blocking::Response) -> String {
+    if !img.format.is_empty() {
+        return img.format.clone();
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    extension_for_mime(&mime).unwrap_or("img").to_string()
+}
+
+/// Map an image MIME type to a conventional extension.
+pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    Some(match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/avif" => "avif",
+        "image/bmp" => "bmp",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "image/tiff" => "tiff",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -394,5 +493,14 @@ mod tests {
         assert_eq!(format_from_url("https://x.com/a.JPG?w=1"), "jpg");
         assert_eq!(format_from_url("https://x.com/a.webp"), "webp");
         assert_eq!(format_from_url("https://x.com/redirect?to=/a.jpg"), "");
+    }
+
+    #[test]
+    fn content_type_supplies_an_extension_when_the_url_has_none() {
+        // Redirector URLs carry no extension; ".img" opens in nothing.
+        assert_eq!(extension_for_mime("image/jpeg"), Some("jpg"));
+        assert_eq!(extension_for_mime("image/webp"), Some("webp"));
+        assert_eq!(extension_for_mime("image/svg+xml"), Some("svg"));
+        assert_eq!(extension_for_mime("text/html"), None);
     }
 }

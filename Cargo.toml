@@ -13,8 +13,10 @@ readme = "README.md"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 directories = "5"
 ego-tree = "0.6"
+encoding_rs = "0.8"
 open = "5"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = [
@@ -31,6 +33,9 @@ toml = "0.8"
 url = "2"
 
 [dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 wiremock = "0.6"
 

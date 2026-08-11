@@ -36,7 +36,7 @@ pub struct FetchResult {
     pub title: Option<String>,
     /// Number of characters in `text`.
     pub chars: usize,
-    /// True when `text` was truncated by `--max-chars`.
+    /// True when content was dropped by any cap (bytes, characters or lines).
     pub truncated: bool,
     /// Boilerplate-free main content.
     pub text: String,
@@ -49,6 +49,39 @@ pub struct SearchOpts {
     pub lang: Option<String>,
     pub region: Option<String>,
     pub safe: bool,
+    /// User-Agent for engines backed by official APIs.
+    ///
+    /// Those endpoints ask, in their usage policies, to be told who is calling.
+    /// Scraped endpoints keep the browser-like agent from the client, because
+    /// they serve challenge pages to anything that looks automated; APIs get
+    /// the truth. See `config::api_user_agent`.
+    pub api_user_agent: String,
+    /// Contact address for APIs with a "polite pool" (OpenAlex, NCBI).
+    /// `None` means webseek makes no claim about who is calling.
+    pub contact_email: Option<String>,
+}
+
+impl Default for SearchOpts {
+    fn default() -> Self {
+        Self {
+            count: 5,
+            lang: None,
+            region: None,
+            safe: false,
+            api_user_agent: crate::config::api_user_agent(),
+            contact_email: None,
+        }
+    }
+}
+
+impl SearchOpts {
+    /// Attach webseek's honest identification to an API request.
+    pub fn identify(
+        &self,
+        rb: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        rb.header(reqwest::header::USER_AGENT, self.api_user_agent.as_str())
+    }
 }
 
 /// Options for a fetch/reader request.
@@ -56,10 +89,21 @@ pub struct SearchOpts {
 pub struct FetchOpts {
     /// Hard cap on the downloaded response body, in bytes.
     pub max_bytes: usize,
-    /// Cap on the extracted text, in characters.
+    /// Cap on the emitted text, in characters (applies to `--html` too).
     pub max_chars: usize,
     /// Emit raw HTML instead of extracted text.
     pub raw_html: bool,
     /// Keep light markdown formatting (headings, lists, links).
     pub markdown: bool,
+}
+
+impl Default for FetchOpts {
+    fn default() -> Self {
+        Self {
+            max_bytes: crate::reader::DEFAULT_MAX_BYTES,
+            max_chars: 20_000,
+            raw_html: false,
+            markdown: false,
+        }
+    }
 }

@@ -3,12 +3,13 @@
 //! No API key required. Result links are `bing.com/ck/a?...&u=<base64>` —
 //! the `u` query parameter is base64-decode to the real URL.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::engines::{dedupe_by_url, SearchEngine};
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::normalize_snippet;
@@ -70,6 +71,13 @@ impl SearchEngine for Bing {
         let resp = crate::http::send_with_retry(&client.get(url))
             .map_err(|e| Error::Network(format!("bing request failed: {e}")))?;
         let status = resp.status();
+        // Classify refusals the same way DuckDuckGo does, so `--verbose` and
+        // the error taxonomy don't depend on which engine answered.
+        if matches!(status.as_u16(), 202 | 403 | 429) {
+            return Err(Error::RateLimited(format!(
+                "bing answered HTTP {status} (retry later or lower request rate)"
+            )));
+        }
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
@@ -79,9 +87,9 @@ impl SearchEngine for Bing {
                 "bing served a bot-challenge page instead of results (IP reputation)".into(),
             ));
         }
-        let mut results = parse_html(&body);
-        results.truncate(opts.count);
-        Ok(dedupe_by_url(results, |r| &r.url))
+        Ok(dedupe_and_truncate(parse_html(&body), opts.count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -111,12 +119,11 @@ impl Bing {
             return None;
         }
         let body = resp.text().ok()?;
-        let mut results = parse_rss(&body);
+        let results = parse_rss(&body);
         if results.is_empty() {
             return None;
         }
-        results.truncate(opts.count);
-        Some(dedupe_by_url(results, |r| &r.url))
+        Some(dedupe_and_truncate(results, opts.count, |r| &r.url))
     }
 }
 
@@ -138,7 +145,9 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
                 url = decode_bing_url(href).unwrap_or_else(|| href.to_string());
             }
         }
-        if title.is_empty() {
+        // A hit without a usable link is not a result: the JSON contract
+        // promises a URL, and DuckDuckGo already skips these.
+        if title.is_empty() || url.is_empty() {
             continue;
         }
         let snippet = li
@@ -200,19 +209,48 @@ fn strip_cdata(s: &str) -> &str {
 }
 
 /// Bing wraps external links in `bing.com/ck/a?...&u=<base64>` redirects.
+///
+/// Live Bing prefixes the payload with a version marker (`a1`) and encodes it
+/// with the **URL-safe, unpadded** alphabet. Decoding it as plain padded
+/// base64 fails, and the old code then fell back to emitting the raw
+/// `bing.com/ck/a?...` tracking link as the result URL — the fixture simply
+/// never contained a real-world value, so the tests agreed with the bug.
 fn decode_bing_url(href: &str) -> Option<String> {
     let url = Url::parse(href).ok()?;
     let is_redirect = url
         .host_str()
-        .map(|h| h.ends_with("bing.com"))
+        .map(|h| h == "bing.com" || h.ends_with(".bing.com"))
         .unwrap_or(false)
         && (url.path().starts_with("/ck/a") || url.path().starts_with("/rd"));
     if !is_redirect {
         return None;
     }
     let raw = url.query_pairs().find(|(k, _)| k == "u")?.1;
-    let decoded = STANDARD.decode(raw.as_bytes()).ok()?;
-    Some(String::from_utf8_lossy(&decoded).into_owned())
+    let decoded = decode_u_param(&raw)?;
+    // Only hand back something that is actually a web URL: a mis-decode must
+    // not smuggle garbage into the JSON contract.
+    let parsed = Url::parse(&decoded).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then_some(decoded)
+}
+
+/// Decode Bing's `u` payload, tolerating the `a1` marker and both alphabets.
+fn decode_u_param(raw: &str) -> Option<String> {
+    // Strip the one-byte version marker Bing prepends ("a1", historically also
+    // "a2"/"a3"); it is not part of the base64 payload.
+    let payload = match raw.as_bytes() {
+        [b'a', d, rest @ ..] if d.is_ascii_digit() => std::str::from_utf8(rest).ok()?,
+        _ => raw,
+    };
+    if payload.is_empty() {
+        return None;
+    }
+    let attempts = [
+        URL_SAFE_NO_PAD.decode(payload).ok(),
+        STANDARD_NO_PAD.decode(payload).ok(),
+        STANDARD.decode(payload).ok(),
+    ];
+    let bytes = attempts.into_iter().flatten().next()?;
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -248,6 +286,50 @@ mod tests {
             Some("https://example.com/rust")
         );
         assert_eq!(decode_bing_url("https://plain.example.org/direct"), None);
+    }
+
+    #[test]
+    fn decodes_the_real_world_a1_prefixed_url_safe_payload() {
+        // This is the shape live Bing actually emits. The previous decoder
+        // returned None here and leaked the tracking URL as the result.
+        let href = "https://www.bing.com/ck/a?!&&p=1&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9ydXN0&ntb=1";
+        assert_eq!(
+            decode_bing_url(href).as_deref(),
+            Some("https://example.com/rust")
+        );
+
+        // URL-safe alphabet: '-' and '_' where standard base64 has '+' and '/'.
+        let payload = URL_SAFE_NO_PAD.encode(b"https://example.com/a?b=c&d=e~f");
+        let href = format!("https://www.bing.com/ck/a?u=a1{payload}");
+        assert_eq!(
+            decode_bing_url(&href).as_deref(),
+            Some("https://example.com/a?b=c&d=e~f")
+        );
+    }
+
+    #[test]
+    fn undecodable_or_non_http_payloads_are_rejected() {
+        // Garbage must not be handed to the caller as a URL.
+        assert_eq!(decode_bing_url("https://www.bing.com/ck/a?u=a1!!!!"), None);
+        assert_eq!(decode_bing_url("https://www.bing.com/ck/a?u="), None);
+        let js = URL_SAFE_NO_PAD.encode(b"javascript:alert(1)");
+        assert_eq!(
+            decode_bing_url(&format!("https://www.bing.com/ck/a?u=a1{js}")),
+            None,
+            "only http(s) targets are acceptable"
+        );
+        // A lookalike host must not be treated as a Bing redirect.
+        assert_eq!(
+            decode_bing_url("https://notbing.com/ck/a?u=a1aHR0cHM6Ly94LmNvbQ"),
+            None
+        );
+    }
+
+    #[test]
+    fn results_without_a_link_are_skipped() {
+        let html = r#"<html><body><ol><li class="b_algo"><h2>No anchor here</h2>
+            <p>snippet</p></li></ol></body></html>"#;
+        assert!(parse_html(html).is_empty(), "a result needs a URL");
     }
 
     #[test]

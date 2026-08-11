@@ -11,7 +11,7 @@ use url::Url;
 use crate::engines::SearchEngine;
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
-use crate::text::unescape_entities;
+use crate::text::{join_meta, normalize_snippet, unescape_entities};
 
 const SEARCH_URL: &str = "https://api.stackexchange.com/2.3/search/advanced";
 
@@ -77,7 +77,7 @@ impl SearchEngine for StackExchange {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
             .map_err(|e| Error::Network(format!("stackexchange request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -97,17 +97,17 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
         .filter(|it| !it.link.is_empty())
         .map(|it| {
             let answered = if it.is_answered { "✓" } else { "–" };
-            let snippet = format!(
-                "[{}] · score {} · {} answers {}",
-                it.tags.join(", "),
-                it.score,
-                it.answer_count,
-                answered
-            );
+            let tags = if it.tags.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", it.tags.join(", "))
+            };
+            let score = format!("score {}", it.score);
+            let answers = format!("{} answers {answered}", it.answer_count);
             SearchResult {
-                title: unescape_entities(&it.title),
+                title: normalize_snippet(&unescape_entities(&it.title)),
                 url: it.link,
-                snippet,
+                snippet: normalize_snippet(&join_meta(&[&tags, &score, &answers])),
             }
         })
         .collect()

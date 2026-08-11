@@ -10,6 +10,7 @@ use url::Url;
 use crate::engines::SearchEngine;
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
+use crate::text::{join_meta, normalize_snippet};
 
 const SEARCH_URL: &str = "https://hn.algolia.com/api/v1/search";
 
@@ -63,7 +64,7 @@ impl SearchEngine for HackerNews {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
             .map_err(|e| Error::Network(format!("hackernews request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -86,16 +87,15 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 .url
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| format!("https://news.ycombinator.com/item?id={}", h.object_id));
-            let snippet = format!(
-                "{} points · {} comments · by {}",
-                h.points.unwrap_or(0),
-                h.num_comments.unwrap_or(0),
-                h.author.as_deref().unwrap_or("?")
-            );
+            let snippet = join_meta(&[
+                &format!("{} points", h.points.unwrap_or(0)),
+                &format!("{} comments", h.num_comments.unwrap_or(0)),
+                &format!("by {}", h.author.as_deref().unwrap_or("?")),
+            ]);
             Some(SearchResult {
-                title,
+                title: normalize_snippet(&title),
                 url,
-                snippet,
+                snippet: normalize_snippet(&snippet),
             })
         })
         .collect()

@@ -7,7 +7,7 @@ use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::engines::{dedupe_by_url, SearchEngine};
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::normalize_snippet;
@@ -45,7 +45,8 @@ impl SearchEngine for DuckDuckGo {
             params.push(("kl", kl.as_str()));
         }
         if opts.safe {
-            params.push(("p", "1"));
+            // DuckDuckGo's safe-search parameter is `kp` (1 = strict).
+            params.push(("kp", "1"));
         }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
@@ -62,9 +63,16 @@ impl SearchEngine for DuckDuckGo {
             return Err(Error::Http(status.as_u16()));
         }
         let body = resp.text().map_err(Error::from)?;
-        let mut results = parse_html(&body);
-        results.truncate(opts.count);
-        Ok(dedupe_by_url(results, |r| &r.url))
+        // A 200 that is really an interstitial must be an error, not an empty
+        // result set, or fallback never triggers.
+        if crate::engines::looks_like_challenge(&body) {
+            return Err(Error::RateLimited(
+                "duckduckgo served a bot-challenge page instead of results".into(),
+            ));
+        }
+        Ok(dedupe_and_truncate(parse_html(&body), opts.count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -78,11 +86,15 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
 
     let mut out = Vec::new();
     for result in doc.select(&result_sel) {
-        // Skip ad blocks (DDG marks them with an "ad" class token).
+        // Skip ad blocks. Matching the *substring* "ad" also matched innocent
+        // class tokens like "shadow", silently dropping real results.
         let is_ad = result
             .value()
             .attr("class")
-            .map(|c| c.split_whitespace().any(|t| t.contains("ad")))
+            .map(|c| {
+                c.split_whitespace()
+                    .any(|t| t == "ad" || t.ends_with("--ad") || t.starts_with("result--ad"))
+            })
             .unwrap_or(false);
         if is_ad {
             continue;
@@ -161,6 +173,22 @@ mod tests {
             results[0].snippet,
             "Rust is a blazingly fast systems language with memory safety."
         );
+    }
+
+    #[test]
+    fn innocent_class_tokens_are_not_mistaken_for_ads() {
+        // "shadow" contains "ad"; a substring match dropped the whole result.
+        let html = r#"<html><body>
+          <div class="result results_links shadow">
+            <a class="result__a" href="https://example.com/keep">Kept</a>
+          </div>
+          <div class="result result--ad">
+            <a class="result__a" href="https://ads.example/x">Sponsored</a>
+          </div>
+        </body></html>"#;
+        let r = parse_html(html);
+        assert_eq!(r.len(), 1, "got: {r:?}");
+        assert_eq!(r[0].url, "https://example.com/keep");
     }
 
     #[test]
