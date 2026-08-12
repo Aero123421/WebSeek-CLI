@@ -511,6 +511,9 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Default cache location: platform cache dir + `webseek/cache.json`.
 pub fn default_cache_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("WEBSEEK_CACHE_DIR").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir).join("cache.json");
+    }
     directories::ProjectDirs::from("dev", "webseek", "webseek")
         .map(|d| d.cache_dir().join("cache.json"))
         .unwrap_or_else(|| PathBuf::from("webseek-cache.json"))

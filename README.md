@@ -287,7 +287,9 @@ cannot pace separate processes, so add your own `sleep` if you loop in a shell.
   enforced; `cache_ttl_secs = 0` means entries never expire. Writes are atomic,
   advisory-locked across processes, and private (`0600` on Unix). Corrupt files
   or entries are dropped and refetched. Use `webseek cache info` / `cache clear`,
-  `--no-cache` / `--cache`, or `cache_max_entries = 0`.
+  `--no-cache` / `--cache`, or `cache_max_entries = 0`. Set
+  `WEBSEEK_CACHE_DIR` to override the platform cache directory; webseek stores
+  `cache.json` and its lock file inside it.
 - **Automatic fallback.** If a **web** engine is rate-limited, errors, *or
   returns nothing*, webseek tries the remaining web engines and reports which
   one served the result. Empty results count as failure because a scraper whose

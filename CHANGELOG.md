@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cache administration:** `webseek cache info`, `webseek cache clear`, and
   `webseek config path`; the cache also has a configurable total byte budget
   (`cache_max_bytes`, default 100 MiB).
+- `WEBSEEK_CACHE_DIR` overrides the platform cache directory, enabling fully
+  isolated CLI runs and reliable Windows automation.
 - **Batch failure policies:** `--fail-on-any-error` and
   `--fail-if-all-error` preserve per-item output while making exit status
   selectable for automation.
