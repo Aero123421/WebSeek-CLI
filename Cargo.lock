@@ -449,6 +449,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12a0bb14ac04a9fcf170d0bbbef949b44cc492f4452bd20c095636956f653642"
 
 [[package]]
+name = "ego-tree"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b04dc5a38e4f151a79d9f2451ae6037fb6eaf5cba34771f44781f80e508498e3"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1685,7 +1691,7 @@ checksum = "b90460b31bfe1fc07be8262e42c665ad97118d4585869de9345a84d501a9eaf0"
 dependencies = [
  "ahash",
  "cssparser",
- "ego-tree",
+ "ego-tree 0.6.3",
  "getopts",
  "html5ever",
  "once_cell",
@@ -2375,7 +2381,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "directories",
- "ego-tree",
+ "ego-tree 0.11.0",
  "encoding_rs",
  "fs2",
  "open",
