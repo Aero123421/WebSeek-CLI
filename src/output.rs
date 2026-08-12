@@ -1,23 +1,67 @@
 //! Output layer.
 //!
 //! Context-saving rules (the core requirement for AI agents):
-//! - **stdout carries data only.** Progress/notes go to stderr (`eprintln!`).
+//! - **stdout carries data only.** Progress/notes go to stderr.
 //! - **Default mode is JSON when stdout is not a TTY** (piped into an agent);
 //!   pretty text only when a human is watching.
 //! - JSON keys are short and stable; nothing is printed before/after the JSON
 //!   document, so it can be parsed directly.
+//! - **JSONL is one JSON *object* per line** — never a bare array or scalar,
+//!   so a line-by-line reader never has to special-case a line.
 //! - Snippets/text are pre-capped, so token cost is bounded.
 //!
 //! Every writer has a `*_to(w, ...)` variant taking any `Write`, which keeps
 //! the JSON contract unit-testable (golden tests).
 
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
 use crate::batch::BatchItem;
+use crate::cli::ColorChoice;
 use crate::engines::EngineInfo;
 use crate::models::{FetchResult, ImageResult, SearchResult};
+
+/// Set once at startup; suppresses notes and warnings on stderr.
+static QUIET: AtomicBool = AtomicBool::new(false);
+/// Set once at startup; whether pretty output may emit ANSI escapes.
+static COLOR: AtomicBool = AtomicBool::new(false);
+
+/// Configure stderr verbosity. Applies to *every* stderr channel, including
+/// cache warnings and batch failures, so `--quiet` really is quiet.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// Resolve the colour policy once, honouring `NO_COLOR` (no-color.org).
+pub fn set_color(choice: ColorChoice) {
+    let enabled = match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => {
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        }
+    };
+    COLOR.store(enabled, Ordering::Relaxed);
+}
+
+fn color_enabled() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+/// Wrap `s` in an ANSI sequence, or return it untouched when colour is off.
+fn paint(s: &str, code: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -42,21 +86,27 @@ impl Mode {
 
 /// A fully-formed JSON document written by `search`.
 #[derive(Serialize)]
-struct SearchDoc {
-    query: String,
-    engine: String,
+struct SearchDoc<'a> {
+    query: &'a str,
+    engine: &'a str,
     count: usize,
-    results: Vec<SearchResult>,
+    results: &'a [SearchResult],
 }
 
 #[derive(Serialize)]
-struct ImageDoc {
-    query: String,
-    engine: String,
+struct ImageDoc<'a> {
+    query: &'a str,
+    engine: &'a str,
     count: usize,
-    results: Vec<ImageResult>,
+    results: &'a [ImageResult],
     #[serde(skip_serializing_if = "Option::is_none")]
     downloaded: Option<Vec<String>>,
+}
+
+/// JSONL envelope for the download list, so every JSONL line is an object.
+#[derive(Serialize)]
+struct DownloadedLine<'a> {
+    downloaded: &'a [String],
 }
 
 pub fn write_search(
@@ -79,10 +129,10 @@ pub fn write_search_to(
     match mode {
         Mode::Json => {
             let doc = SearchDoc {
-                query: query.to_string(),
-                engine: engine.to_string(),
+                query,
+                engine,
                 count: results.len(),
-                results: results.to_vec(),
+                results,
             };
             writeln!(w, "{}", serde_json::to_string(&doc)?)?;
         }
@@ -97,8 +147,8 @@ pub fn write_search_to(
                 return Ok(());
             }
             for (i, r) in results.iter().enumerate() {
-                writeln!(w, "\x1b[1m{:>2}. {}\x1b[0m", i + 1, r.title)?;
-                writeln!(w, "     \x1b[36m{}\x1b[0m", r.url)?;
+                writeln!(w, "{}", paint(&format!("{:>2}. {}", i + 1, r.title), "1"))?;
+                writeln!(w, "     {}", paint(&r.url, "36"))?;
                 if !r.snippet.is_empty() {
                     writeln!(w, "     {}", r.snippet)?;
                 }
@@ -130,10 +180,10 @@ pub fn write_images_to(
     match mode {
         Mode::Json => {
             let doc = ImageDoc {
-                query: query.to_string(),
-                engine: engine.to_string(),
+                query,
+                engine,
                 count: results.len(),
-                results: results.to_vec(),
+                results,
                 downloaded,
             };
             writeln!(w, "{}", serde_json::to_string(&doc)?)?;
@@ -142,16 +192,20 @@ pub fn write_images_to(
             for r in results {
                 writeln!(w, "{}", serde_json::to_string(r)?)?;
             }
-            if let Some(dl) = downloaded {
-                if !dl.is_empty() {
-                    writeln!(w, "{}", serde_json::to_string(&dl)?)?;
-                }
+            if let Some(dl) = &downloaded {
+                // Wrapped in an object: a bare `["a.jpg"]` line would break the
+                // "every JSONL line is an object" contract.
+                writeln!(
+                    w,
+                    "{}",
+                    serde_json::to_string(&DownloadedLine { downloaded: dl })?
+                )?;
             }
         }
         Mode::Pretty => {
             for (i, r) in results.iter().enumerate() {
-                writeln!(w, "\x1b[1m{:>2}. {}\x1b[0m", i + 1, r.title)?;
-                writeln!(w, "     \x1b[36m{}\x1b[0m", r.url)?;
+                writeln!(w, "{}", paint(&format!("{:>2}. {}", i + 1, r.title), "1"))?;
+                writeln!(w, "     {}", paint(&r.url, "36"))?;
                 let dims = match (r.width, r.height) {
                     (Some(w_), Some(h)) => format!("{w_}x{h}"),
                     _ => "?".into(),
@@ -163,7 +217,7 @@ pub fn write_images_to(
                 if !dl.is_empty() {
                     writeln!(w, "Downloaded {} file(s):", dl.len())?;
                     for p in &dl {
-                        writeln!(w, "  \x1b[32m{p}\x1b[0m")?;
+                        writeln!(w, "  {}", paint(p, "32"))?;
                     }
                 }
             }
@@ -184,9 +238,9 @@ pub fn write_fetch_to(w: &mut impl Write, mode: Mode, fetch: &FetchResult) -> st
         }
         Mode::Pretty => {
             if let Some(title) = &fetch.title {
-                writeln!(w, "\x1b[1m{title}\x1b[0m")?;
+                writeln!(w, "{}", paint(title, "1"))?;
             }
-            writeln!(w, "\x1b[36m{}\x1b[0m", fetch.url)?;
+            writeln!(w, "{}", paint(&fetch.url, "36"))?;
             writeln!(
                 w,
                 "{} chars{}",
@@ -228,9 +282,7 @@ pub fn write_fetch_batch_to(
             for item in items {
                 match item {
                     BatchItem::Ok(fetch) => write_fetch_to(w, mode, fetch)?,
-                    BatchItem::Err { url, error } => {
-                        eprintln!("[webseek] {url}: {error}");
-                    }
+                    BatchItem::Err { url, error, .. } => warn(&format!("{url}: {error}")),
                 }
             }
         }
@@ -260,21 +312,38 @@ pub fn write_engines_to(
         }
         Mode::Pretty => {
             for e in engines {
+                let alias = if e.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (aliases: {})", e.aliases.join(", "))
+                };
                 writeln!(
                     w,
-                    "\x1b[1m{:<22}\x1b[0m [\x1b[36m{:<12}\x1b[0m] {}",
-                    e.name, e.kind, e.description
+                    "{} [{}] {}{}",
+                    paint(&format!("{:<14}", e.name), "1"),
+                    paint(&format!("{:<12}", e.kind), "36"),
+                    e.description,
+                    alias
                 )?;
-                writeln!(w, "    \x1b[2m{}\x1b[0m", e.example)?;
+                writeln!(w, "    {}", paint(e.example, "2"))?;
             }
         }
     }
     Ok(())
 }
 
-/// Note for stderr; only shown in verbose mode by the caller.
+/// Progress note for stderr; callers gate these on `--verbose`.
 pub fn note(msg: &str) {
-    eprintln!("[webseek] {msg}");
+    if !is_quiet() {
+        eprintln!("[webseek] {msg}");
+    }
+}
+
+/// Non-fatal warning for stderr. Suppressed by `--quiet` like any other note.
+pub fn warn(msg: &str) {
+    if !is_quiet() {
+        eprintln!("[webseek] {msg}");
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +379,6 @@ mod tests {
     fn search_json_contract_is_stable() {
         let mut buf = Vec::new();
         write_search_to(&mut buf, Mode::Json, "q", "duckduckgo", &[sample_search()]).unwrap();
-        // Exact-string golden: guards both keys and formatting stability.
         assert_eq!(
             std::str::from_utf8(&buf).unwrap(),
             "{\"query\":\"q\",\"engine\":\"duckduckgo\",\"count\":1,\"results\":[{\"title\":\"T\",\"url\":\"https://example.com\",\"snippet\":\"S\"}]}\n"
@@ -403,13 +471,40 @@ mod tests {
     }
 
     #[test]
+    fn every_jsonl_line_is_an_object() {
+        let img = ImageResult {
+            title: "I".into(),
+            url: "https://cdn/x.jpg".into(),
+            page_url: "https://p".into(),
+            width: None,
+            height: None,
+            format: "jpg".into(),
+        };
+        let mut buf = Vec::new();
+        write_images_to(
+            &mut buf,
+            Mode::Jsonl,
+            "q",
+            "bing",
+            &[img],
+            Some(vec!["f.jpg".into()]),
+        )
+        .unwrap();
+        for line in std::str::from_utf8(&buf).unwrap().lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            assert!(v.is_object(), "JSONL line must be an object, got: {line}");
+        }
+        let last: Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap().lines().last().unwrap())
+                .unwrap();
+        assert_eq!(last, json!({"downloaded": ["f.jpg"]}));
+    }
+
+    #[test]
     fn fetch_batch_json_is_ordered_array_with_errors() {
         let items = vec![
             BatchItem::Ok(sample_fetch()),
-            BatchItem::Err {
-                url: "https://bad".into(),
-                error: "boom".into(),
-            },
+            BatchItem::err("https://bad", "boom"),
         ];
         let mut buf = Vec::new();
         write_fetch_batch_to(&mut buf, Mode::Json, &items).unwrap();
@@ -423,7 +518,7 @@ mod tests {
                     "truncated": false,
                     "text": "hello"
                 },
-                { "url": "https://bad", "error": "boom" }
+                { "url": "https://bad", "error": "boom", "kind": "network" }
             ])
         );
     }
@@ -432,10 +527,7 @@ mod tests {
     fn fetch_batch_jsonl_is_one_item_per_line() {
         let items = vec![
             BatchItem::Ok(sample_fetch()),
-            BatchItem::Err {
-                url: "https://bad".into(),
-                error: "boom".into(),
-            },
+            BatchItem::err("https://bad", "boom"),
         ];
         let mut buf = Vec::new();
         write_fetch_batch_to(&mut buf, Mode::Jsonl, &items).unwrap();
@@ -444,6 +536,52 @@ mod tests {
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["url"], json!("https://example.com"));
         let second: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(second, json!({"url":"https://bad","error":"boom"}));
+        assert_eq!(
+            second,
+            json!({"url":"https://bad","error":"boom","kind":"network"})
+        );
+    }
+
+    #[test]
+    fn a_single_url_batch_is_still_an_array() {
+        // `--array` exists so agents can opt into one shape regardless of the
+        // number of URLs they passed.
+        let items = vec![BatchItem::Ok(sample_fetch())];
+        let mut buf = Vec::new();
+        write_fetch_batch_to(&mut buf, Mode::Json, &items).unwrap();
+        assert!(to_value(&buf).is_array());
+    }
+
+    #[test]
+    fn engine_catalog_exposes_usable_names_and_aliases() {
+        let mut buf = Vec::new();
+        write_engines_to(&mut buf, Mode::Json, &crate::engines::catalog()).unwrap();
+        let v = to_value(&buf);
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty());
+        let hn = arr
+            .iter()
+            .find(|e| e["name"] == json!("hackernews"))
+            .expect("hackernews in catalog");
+        assert_eq!(hn["command"], json!("search"));
+        assert_eq!(hn["aliases"], json!(["hn"]));
+        assert_eq!(hn["fallback"], json!(false), "verticals do not fall back");
+        let ddg = arr
+            .iter()
+            .find(|e| e["name"] == json!("duckduckgo") && e["command"] == json!("search"))
+            .unwrap();
+        assert_eq!(ddg["fallback"], json!(true));
+    }
+
+    #[test]
+    fn pretty_output_has_no_ansi_when_color_is_off() {
+        set_color(ColorChoice::Never);
+        let mut buf = Vec::new();
+        write_search_to(&mut buf, Mode::Pretty, "q", "ddg", &[sample_search()]).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            !s.contains('\x1b'),
+            "escapes leaked with --color=never: {s:?}"
+        );
     }
 }

@@ -67,7 +67,8 @@ impl SearchEngine for Wikipedia {
         let url = Url::parse_with_params(&base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("wikipedia request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -96,14 +97,16 @@ pub fn parse_results(body: &str, lang: &str) -> Vec<SearchResult> {
         .collect()
 }
 
-/// `https://{lang}.wikipedia.org/wiki/{Title_With_Underscores}`; the URL
-/// parser percent-encodes non-ASCII titles.
+/// `https://{lang}.wikipedia.org/wiki/{Title_With_Underscores}`.
+///
+/// The title is percent-encoded as a single path segment. Interpolating it
+/// raw and letting `Url::parse` sort it out silently reinterpreted `#` and `?`
+/// as a fragment or query — the article "C#" became a link to "C".
 fn wiki_url(lang: &str, title: &str) -> String {
-    let raw = format!(
+    format!(
         "https://{lang}.wikipedia.org/wiki/{}",
-        title.replace(' ', "_")
-    );
-    Url::parse(&raw).map(|u| u.to_string()).unwrap_or(raw)
+        crate::text::encode_path_keep_slashes(&title.replace(' ', "_"))
+    )
 }
 
 #[cfg(test)]
@@ -123,6 +126,31 @@ mod tests {
         assert_eq!(r[0].url, "https://en.wikipedia.org/wiki/Tokio_(software)");
         assert_eq!(r[0].snippet, "an async runtime & more");
         assert_eq!(r[1].url, "https://en.wikipedia.org/wiki/Async/await");
+    }
+
+    #[test]
+    fn titles_with_url_syntax_stay_on_the_right_article() {
+        let r = parse_results(
+            r#"{"query":{"search":[
+                {"title":"C#","snippet":""},
+                {"title":"Who's Next?","snippet":""},
+                {"title":"Rust (programming language)","snippet":""}
+            ]}}"#,
+            "en",
+        );
+        // "C#" used to resolve to .../wiki/C with an empty fragment.
+        assert_eq!(r[0].url, "https://en.wikipedia.org/wiki/C%23");
+        assert_eq!(r[1].url, "https://en.wikipedia.org/wiki/Who's_Next%3F");
+        // Parentheses are legal in a path and must not be over-escaped.
+        assert_eq!(
+            r[2].url,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
+        for hit in &r {
+            let parsed = url::Url::parse(&hit.url).unwrap();
+            assert!(parsed.fragment().is_none(), "{}", hit.url);
+            assert!(parsed.query().is_none(), "{}", hit.url);
+        }
     }
 
     #[test]

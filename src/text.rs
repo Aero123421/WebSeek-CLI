@@ -15,11 +15,64 @@ pub fn normalize_snippet(s: &str) -> String {
     }
 }
 
-/// Turn an arbitrary string into a safe, unique-ish filename stem.
+/// Longest filename stem we will produce.
+///
+/// Common filesystems cap a single name at 255 *bytes*; image titles routinely
+/// run longer than that, and a rejected `write` used to abort the whole
+/// download. Non-ASCII titles cost several bytes per character, so the budget
+/// is counted in bytes, not chars.
+pub const MAX_NAME_BYTES: usize = 120;
+
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+/// Characters that must never survive into a URL path unescaped: they would
+/// silently re-interpret the rest of the URL as a query or fragment.
+const PATH_UNSAFE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'\\')
+    .add(b'%')
+    .add(b'^')
+    .add(b'|')
+    .add(b'[')
+    .add(b']');
+
+/// Same, plus `/` — for values that must stay inside a single path segment.
+const SEGMENT_UNSAFE: &AsciiSet = &PATH_UNSAFE.add(b'/');
+
+/// Percent-encode a single URL path **segment**, escaping `/` as well.
+///
+/// Building a URL by string interpolation lets `#` and `?` in the input become
+/// a fragment or a query, and lets `../` walk to an unrelated path. Use this
+/// wherever the value must stay confined to one segment (PyPI package names).
+pub fn encode_path_segment(s: &str) -> String {
+    utf8_percent_encode(s, SEGMENT_UNSAFE).to_string()
+}
+
+/// Percent-encode a URL path that is *allowed* to contain `/`.
+///
+/// MediaWiki titles legitimately embed slashes — the article "Async/await"
+/// lives at `/wiki/Async/await` — so escaping them would break the link. `#`
+/// and `?` are still escaped, which is the bug that mattered ("C#" resolved to
+/// the article "C" with an empty fragment).
+pub fn encode_path_keep_slashes(s: &str) -> String {
+    utf8_percent_encode(s, PATH_UNSAFE).to_string()
+}
+
+/// Turn an arbitrary string into a safe, bounded filename stem.
 ///
 /// - Non-alphanumeric characters become `-`
 /// - Runs of `-` collapse
 /// - Edge dashes are trimmed
+/// - Reserved Windows device names are escaped
+/// - The result is capped at [`MAX_NAME_BYTES`] on a char boundary
 /// - Empty results become `"image"`
 pub fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
@@ -45,12 +98,34 @@ pub fn sanitize_name(name: &str) -> String {
             prev_dash = false;
         }
     }
-    let trimmed = collapsed.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "image".into()
-    } else {
-        trimmed
+    let trimmed = collapsed.trim_matches('-');
+    // Truncate on a char boundary so multi-byte titles stay valid UTF-8.
+    let mut end = trimmed.len().min(MAX_NAME_BYTES);
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
     }
+    let bounded = trimmed[..end].trim_matches('-');
+
+    if bounded.is_empty() || bounded.chars().all(|c| c == '.') {
+        return "image".into();
+    }
+    // CON, NUL, LPT1 … are not usable filenames on Windows, even with an
+    // extension. `text` is where cross-platform filename differences live.
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let stem = bounded.split('.').next().unwrap_or(bounded);
+    if RESERVED.contains(&stem.to_ascii_lowercase().as_str()) {
+        // Re-trim: the suffix must not push the name back over the budget.
+        let room = MAX_NAME_BYTES.saturating_sub("-file".len());
+        let mut end = bounded.len().min(room);
+        while end > 0 && !bounded.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{}-file", &bounded[..end]);
+    }
+    bounded.to_string()
 }
 
 /// Truncate to at most `max` characters (char-boundary safe for UTF-8).
@@ -58,16 +133,50 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Join metadata fragments with " · ", dropping empty ones.
+///
+/// Building these with `format!("{a} · {b}")` left a dangling separator
+/// whenever a field was missing ("` · v1.0 · 3 downloads`").
+pub fn join_meta(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// Remove HTML/XML tags, leaving their text content.
+///
+/// A bare `<` is only treated as a tag opener when what follows could actually
+/// start one (`<p`, `</p`, `<!--`, `<?`). Otherwise prose and code containing
+/// comparisons — `if x < y then` — lost everything up to the next `>`.
 pub fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+    let mut chars = s.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        let starts_tag = matches!(
+            chars.peek().map(|(_, c)| *c),
+            Some(c) if c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?'
+        );
+        if !starts_tag {
+            out.push('<');
+            continue;
+        }
+        // Consume up to and including the closing '>'.
+        let mut closed = false;
+        for (_, c) in chars.by_ref() {
+            if c == '>' {
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            break; // unterminated tag: drop the remainder
         }
     }
     out
@@ -147,20 +256,36 @@ pub fn strip_html(s: &str) -> String {
 /// because its `<` is not a literal `<`.
 pub fn extract_tag(segment: &str, tag: &str) -> String {
     let open = format!("<{tag}");
-    let Some(start) = segment.find(&open) else {
-        return String::new();
-    };
-    let after_open = &segment[start + open.len()..];
-    // Skip any attributes to the end of the opening tag.
-    let Some(gt) = after_open.find('>') else {
-        return String::new();
-    };
-    let inner = &after_open[gt + 1..];
     let close = format!("</{tag}>");
-    let Some(end) = inner.find(&close) else {
-        return String::new();
-    };
-    inner[..end].to_string()
+    let mut from = 0usize;
+
+    while let Some(rel) = segment[from..].find(&open) {
+        let start = from + rel;
+        let after_open = &segment[start + open.len()..];
+        // The tag name must end here — otherwise `<link` also matches
+        // `<linkedin>` and we return the wrong element's contents.
+        let name_ends = matches!(
+            after_open.chars().next(),
+            Some(c) if c == '>' || c == '/' || c.is_whitespace()
+        );
+        if !name_ends {
+            from = start + open.len();
+            continue;
+        }
+        let Some(gt) = after_open.find('>') else {
+            return String::new();
+        };
+        // A self-closing `<tag/>` has no inner text.
+        if after_open[..gt].ends_with('/') {
+            return String::new();
+        }
+        let inner = &after_open[gt + 1..];
+        return match inner.find(&close) {
+            Some(end) => inner[..end].to_string(),
+            None => String::new(),
+        };
+    }
+    String::new()
 }
 
 /// Value of the first `attr="..."` in `segment` (e.g. `href`, `label`).
@@ -196,6 +321,98 @@ mod tests {
         assert_eq!(sanitize_name(""), "image");
         assert_eq!(sanitize_name("A/B\\C"), "A-B-C");
         assert_eq!(sanitize_name("---x---"), "x");
+    }
+
+    #[test]
+    fn filenames_stay_within_filesystem_limits() {
+        // A long image title used to produce a name the OS refuses, which
+        // aborted the entire download run.
+        let long = sanitize_name(&"word ".repeat(200));
+        assert!(long.len() <= MAX_NAME_BYTES, "got {} bytes", long.len());
+        assert!(!long.is_empty());
+
+        let jp = sanitize_name(&"日本語のタイトル".repeat(40));
+        assert!(jp.len() <= MAX_NAME_BYTES);
+        assert!(
+            std::str::from_utf8(jp.as_bytes()).is_ok(),
+            "must not cut a multi-byte char in half"
+        );
+    }
+
+    #[test]
+    fn dangerous_and_reserved_names_are_neutralised() {
+        // No path traversal can survive: separators become dashes, so the
+        // result is always a single, harmless path component.
+        for hostile in ["../../etc/passwd", "..\\..\\win", "/abs/path", "a/../b"] {
+            let name = sanitize_name(hostile);
+            assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+            assert_eq!(
+                std::path::Path::new(&name).components().count(),
+                1,
+                "{hostile:?} produced a multi-component path: {name}"
+            );
+        }
+        assert_eq!(sanitize_name(".."), "image");
+        assert_eq!(sanitize_name("."), "image");
+        // Windows device names are not usable even with an extension.
+        assert_eq!(sanitize_name("CON"), "CON-file");
+        // The suffix must not push the name back over the byte budget.
+        let long_reserved = sanitize_name(&format!("con.{}", "x".repeat(400)));
+        assert!(
+            long_reserved.len() <= MAX_NAME_BYTES,
+            "{}",
+            long_reserved.len()
+        );
+        assert_eq!(sanitize_name("nul"), "nul-file");
+        assert_eq!(sanitize_name("console"), "console");
+    }
+
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        // "C#" must not become the article "C" with an empty fragment.
+        assert_eq!(encode_path_segment("C#"), "C%23");
+        assert_eq!(encode_path_segment("Who's_Next?"), "Who's_Next%3F");
+        assert_eq!(encode_path_segment("Rust_(lang)"), "Rust_(lang)");
+        assert_eq!(encode_path_segment("東京"), "%E6%9D%B1%E4%BA%AC");
+        // Strict form confines the value to one segment.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("../../simple"), "..%2F..%2Fsimple");
+    }
+
+    #[test]
+    fn slash_preserving_encoding_keeps_legitimate_subpaths() {
+        // MediaWiki titles may contain '/': "Async/await" is one article.
+        assert_eq!(encode_path_keep_slashes("Async/await"), "Async/await");
+        assert_eq!(encode_path_keep_slashes("C#"), "C%23");
+        assert_eq!(encode_path_keep_slashes("a?b"), "a%3Fb");
+    }
+
+    #[test]
+    fn strip_tags_keeps_mathematical_comparisons() {
+        assert_eq!(strip_tags("if x < y then z"), "if x < y then z");
+        assert_eq!(strip_tags("a <b>bold</b> c"), "a bold c");
+        assert_eq!(strip_tags("3 < 4 and 5 > 2"), "3 < 4 and 5 > 2");
+        assert_eq!(strip_tags("<p>text</p>"), "text");
+    }
+
+    #[test]
+    fn extract_tag_requires_a_complete_tag_name() {
+        // `<link` must not match `<linkedin>`.
+        let seg = "<linkedin>nope</linkedin><link>yes</link>";
+        assert_eq!(extract_tag(seg, "link"), "yes");
+        assert_eq!(extract_tag("<title >spaced</title>", "title"), "spaced");
+        assert_eq!(extract_tag("<link/>", "link"), "");
+    }
+
+    #[test]
+    fn join_meta_never_leaves_a_dangling_separator() {
+        assert_eq!(
+            join_meta(&["Async runtime", "v1.0", "9 downloads"]),
+            "Async runtime · v1.0 · 9 downloads"
+        );
+        assert_eq!(join_meta(&["", "v1.0"]), "v1.0");
+        assert_eq!(join_meta(&["desc", "", ""]), "desc");
+        assert_eq!(join_meta(&["", "  ", ""]), "");
     }
 
     #[test]

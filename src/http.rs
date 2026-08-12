@@ -86,7 +86,14 @@ pub fn send_with_retry_policy(rb: &RequestBuilder, policy: &RetryPolicy) -> Resu
                 let status = resp.status().as_u16();
                 if is_retryable_status(status) && attempt + 1 < attempts {
                     last_err = Some(Error::Http(status));
-                    jittered_sleep(attempt, policy);
+                    // When the server tells us how long to wait, believe it:
+                    // our own backoff is a guess, `Retry-After` is an answer.
+                    match retry_after_secs(&resp) {
+                        Some(secs) => std::thread::sleep(Duration::from_millis(
+                            (secs * 1000).min(policy.max_ms),
+                        )),
+                        None => jittered_sleep(attempt, policy),
+                    }
                     continue;
                 }
                 return Ok(resp);
@@ -105,6 +112,21 @@ pub fn send_with_retry_policy(rb: &RequestBuilder, policy: &RetryPolicy) -> Resu
 /// Statuses worth retrying: DDG's 202 "try again", 429 rate limit, and 5xx.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 202 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// `Retry-After` in delta-seconds form, if the server sent one.
+///
+/// Only the numeric form is honored; the HTTP-date form would need a date
+/// parser for a header that upstreams here send as seconds anyway.
+fn retry_after_secs(resp: &Response) -> Option<u64> {
+    parse_retry_after(resp.headers().get(header::RETRY_AFTER)?.to_str().ok()?)
+}
+
+/// Pure half of [`retry_after_secs`].
+pub fn parse_retry_after(value: &str) -> Option<u64> {
+    let secs: u64 = value.trim().parse().ok()?;
+    // Never sleep longer than a CLI invocation reasonably should.
+    Some(secs.min(60))
 }
 
 /// Deterministic exponential component: `base * 2^attempt`, capped at `max`.
@@ -166,10 +188,22 @@ mod tests {
     }
 
     #[test]
-    fn build_client_sets_browser_headers() {
-        let client = build_client(Duration::from_secs(5), "ua-test").unwrap();
-        // A client built without error is enough; header presence is asserted
-        // indirectly via successful real/mock requests elsewhere.
-        let _ = client;
+    fn build_client_succeeds_with_a_custom_agent() {
+        // Header *content* is asserted on the wire by
+        // `tests::engines::browser_headers_reach_the_server`; this only
+        // guarantees the builder itself is well-formed.
+        assert!(build_client(Duration::from_secs(5), "ua-test").is_ok());
+        assert!(build_client(Duration::from_secs(5), "").is_ok());
+    }
+
+    #[test]
+    fn retry_after_is_parsed_and_bounded() {
+        assert_eq!(parse_retry_after("5"), Some(5));
+        assert_eq!(parse_retry_after("  12 "), Some(12));
+        // A hostile or absurd value must not park the CLI for an hour.
+        assert_eq!(parse_retry_after("100000"), Some(60));
+        // The HTTP-date form is not honored; we fall back to our own backoff.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after(""), None);
     }
 }

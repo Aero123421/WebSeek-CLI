@@ -29,9 +29,7 @@ fn client() -> Client {
 fn opts() -> SearchOpts {
     SearchOpts {
         count: 5,
-        lang: None,
-        region: None,
-        safe: false,
+        ..Default::default()
     }
 }
 
