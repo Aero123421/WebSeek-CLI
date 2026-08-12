@@ -117,7 +117,13 @@ pub fn sanitize_name(name: &str) -> String {
     ];
     let stem = bounded.split('.').next().unwrap_or(bounded);
     if RESERVED.contains(&stem.to_ascii_lowercase().as_str()) {
-        return format!("{bounded}-file");
+        // Re-trim: the suffix must not push the name back over the budget.
+        let room = MAX_NAME_BYTES.saturating_sub("-file".len());
+        let mut end = bounded.len().min(room);
+        while end > 0 && !bounded.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{}-file", &bounded[..end]);
     }
     bounded.to_string()
 }
@@ -350,6 +356,13 @@ mod tests {
         assert_eq!(sanitize_name("."), "image");
         // Windows device names are not usable even with an extension.
         assert_eq!(sanitize_name("CON"), "CON-file");
+        // The suffix must not push the name back over the byte budget.
+        let long_reserved = sanitize_name(&format!("con.{}", "x".repeat(400)));
+        assert!(
+            long_reserved.len() <= MAX_NAME_BYTES,
+            "{}",
+            long_reserved.len()
+        );
         assert_eq!(sanitize_name("nul"), "nul-file");
         assert_eq!(sanitize_name("console"), "console");
     }

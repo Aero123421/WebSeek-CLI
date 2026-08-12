@@ -88,7 +88,8 @@ impl SearchEngine for OpenAlex {
         }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("openalex request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -204,7 +205,8 @@ impl SearchEngine for CrossRef {
         }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("crossref request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -314,7 +316,8 @@ impl SearchEngine for PubMed {
         eutils_identity(&mut params, opts);
         let url = Url::parse_with_params(&self.esummary_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esummary failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -351,7 +354,8 @@ impl PubMed {
         eutils_identity(&mut params, opts);
         let url = Url::parse_with_params(&self.esearch_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esearch failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));

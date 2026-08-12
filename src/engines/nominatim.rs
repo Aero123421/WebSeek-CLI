@@ -68,7 +68,8 @@ impl SearchEngine for Nominatim {
         ];
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("nominatim request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));

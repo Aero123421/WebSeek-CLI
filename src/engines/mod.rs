@@ -26,7 +26,7 @@ pub mod wikipedia;
 use reqwest::blocking::Client;
 
 use crate::error::Result;
-use crate::models::{ImageResult, SearchOpts, SearchResult};
+use crate::models::{ImageOpts, ImageResult, SearchOpts, SearchResult};
 
 /// A text search backend.
 pub trait SearchEngine {
@@ -37,13 +37,7 @@ pub trait SearchEngine {
 /// An image search backend.
 pub trait ImageEngine {
     fn name(&self) -> &'static str;
-    fn search(
-        &self,
-        client: &Client,
-        query: &str,
-        count: usize,
-        safe: bool,
-    ) -> Result<Vec<ImageResult>>;
+    fn search(&self, client: &Client, query: &str, opts: &ImageOpts) -> Result<Vec<ImageResult>>;
 }
 
 /// Engine kind. `Web` engines are interchangeable general-purpose search and
@@ -454,8 +448,40 @@ mod tests {
 
     #[test]
     fn registry_is_the_only_source_of_truth() {
+        // The tautology guard: catalog() maps over the registries, so feeding
+        // its names back into the registry lookup can never fail. What *can*
+        // break is the shape of those names — a label like "bing (images)" is
+        // not something `--engine` accepts — and the completeness of the
+        // mapping.
+        let catalog = catalog();
+        assert_eq!(
+            catalog.len(),
+            TEXT_REGISTRY.len() + IMAGE_REGISTRY.len(),
+            "catalog dropped or duplicated an engine"
+        );
+        for info in &catalog {
+            assert!(
+                !info.name.contains(char::is_whitespace) && !info.name.contains('('),
+                "catalog name {:?} is a label, not an --engine value",
+                info.name
+            );
+            assert!(!info.description.is_empty() && !info.example.is_empty());
+            assert!(
+                info.example
+                    .starts_with(&format!("webseek {}", info.command)),
+                "example for {} does not use the `{}` subcommand: {}",
+                info.name,
+                info.command,
+                info.example
+            );
+        }
+        assert!(
+            catalog.iter().any(|e| e.fallback) && catalog.iter().any(|e| !e.fallback),
+            "the fallback flag must distinguish web engines from verticals"
+        );
+
         // Every catalog entry must be a usable `--engine` value.
-        for info in catalog() {
+        for info in catalog {
             match info.command {
                 "search" => assert!(
                     is_known_engine(info.name),

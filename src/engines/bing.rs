@@ -68,7 +68,8 @@ impl SearchEngine for Bing {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send(client.get(url))
             .map_err(|e| Error::Network(format!("bing request failed: {e}")))?;
         let status = resp.status();
         // Classify refusals the same way DuckDuckGo does, so `--verbose` and
@@ -114,7 +115,7 @@ impl Bing {
             params.push(("adlt", "strict"));
         }
         let url = Url::parse_with_params(&self.base, &params).ok()?;
-        let resp = crate::http::send_with_retry(&client.get(url)).ok()?;
+        let resp = opts.send(client.get(url)).ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -225,12 +226,27 @@ fn decode_bing_url(href: &str) -> Option<String> {
     if !is_redirect {
         return None;
     }
-    let raw = url.query_pairs().find(|(k, _)| k == "u")?.1;
+    // `query_pairs()` applies form-urlencoded rules, where `+` becomes a
+    // space — which corrupts every standard-alphabet payload containing `+`
+    // and silently leaks the tracking URL. Read the raw parameter instead.
+    let raw = raw_query_param(url.query()?, "u")?;
     let decoded = decode_u_param(&raw)?;
     // Only hand back something that is actually a web URL: a mis-decode must
     // not smuggle garbage into the JSON contract.
     let parsed = Url::parse(&decoded).ok()?;
     matches!(parsed.scheme(), "http" | "https").then_some(decoded)
+}
+
+/// Value of `name` in a query string, percent-decoded but **not** form-decoded.
+fn raw_query_param(query: &str, name: &str) -> Option<String> {
+    let raw = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))?;
+    Some(
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 /// Decode Bing's `u` payload, tolerating the `a1` marker and both alphabets.
@@ -305,6 +321,18 @@ mod tests {
             decode_bing_url(&href).as_deref(),
             Some("https://example.com/a?b=c&d=e~f")
         );
+    }
+
+    #[test]
+    fn standard_alphabet_payloads_containing_plus_survive() {
+        // `query_pairs()` form-decodes `+` to a space, which corrupted every
+        // standard-base64 payload that happened to contain one — and the
+        // fallback then leaked the raw tracking URL as the result.
+        let target = "https://example.com/a?b=c&d=e~f";
+        let payload = STANDARD.encode(target);
+        assert!(payload.contains('+'), "fixture must exercise the bug");
+        let href = format!("https://www.bing.com/ck/a?u=a1{payload}&ntb=1");
+        assert_eq!(decode_bing_url(&href).as_deref(), Some(target));
     }
 
     #[test]

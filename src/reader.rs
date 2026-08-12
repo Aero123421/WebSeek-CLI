@@ -166,17 +166,20 @@ fn meta_charset(bytes: &[u8]) -> Option<Vec<u8>> {
         rest = &rest[idx + 5..];
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
-        // <meta charset="shift_jis">
-        if let Some(v) = attr_value(tag, "charset") {
-            return Some(v.into_bytes());
-        }
         // <meta http-equiv="Content-Type" content="text/html; charset=euc-jp">
+        // Checked first: the word "charset" also occurs *inside* that quoted
+        // `content` value, so looking for a bare charset attribute first
+        // matched the wrong thing and returned a label with a stray quote.
         if tag.contains("http-equiv") {
             if let Some(content) = attr_value(tag, "content") {
                 if let Some(cs) = charset_from_content_type_str(&content) {
                     return Some(cs.into_bytes());
                 }
             }
+        }
+        // <meta charset="shift_jis">
+        if let Some(v) = attr_value(tag, "charset") {
+            return Some(v.into_bytes());
         }
         rest = &rest[tag_end.min(rest.len())..];
     }
@@ -186,89 +189,94 @@ fn meta_charset(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Read `name=value` from a lower-cased tag body, quoted or bare.
 fn attr_value(tag: &str, name: &str) -> Option<String> {
     let mut rest = tag;
+    let mut consumed = 0usize;
     loop {
         let idx = rest.find(name)?;
+        // The name must start an attribute, not sit inside another one's
+        // value: `content="…charset=euc-jp"` contains "charset".
+        let at_boundary = idx + consumed == 0
+            || tag[..idx + consumed]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace());
+        if !at_boundary {
+            consumed += idx + name.len();
+            rest = &rest[idx + name.len()..];
+            continue;
+        }
         let after = &rest[idx + name.len()..];
         let trimmed = after.trim_start();
         if let Some(eq) = trimmed.strip_prefix('=') {
             let v = eq.trim_start();
             let value = match v.chars().next() {
                 Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
-                _ => v.split_whitespace().next().unwrap_or_default(),
+                // A bare value ends at whitespace or the next quote.
+                _ => v
+                    .split([' ', '\t', '\n', '\r', '"', '\''])
+                    .next()
+                    .unwrap_or_default(),
             };
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());
             }
         }
+        consumed += idx + name.len();
         rest = &rest[idx + name.len()..];
     }
 }
 
+/// Elements with no end tag; they never open a level.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Elements the parser closes implicitly, so a missing end tag is ordinary
+/// sloppiness rather than nesting. Counting them would reject valid pages.
+const AUTO_CLOSING: &[&str] = &[
+    "p", "li", "td", "th", "tr", "dt", "dd", "option", "optgroup", "thead", "tbody", "tfoot",
+    "caption", "colgroup", "rt", "rp",
+];
+
+/// Elements whose contents are text, not markup. A `<` in here opens nothing.
+const RAW_TEXT: &[&str] = &[
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "noembed",
+    "noframes",
+    "iframe",
+    "plaintext",
+];
+
 /// Approximate maximum element nesting depth of a document.
 ///
-/// Only tags that are always closed explicitly are counted, so the common
-/// real-world sloppiness that html5ever silently repairs — unclosed `<p>`,
-/// `<li>`, `<td>` — cannot inflate the estimate and reject a valid page.
+/// This is a miniature tokenizer rather than a substring scan, because both
+/// directions of inaccuracy are harmful:
+///
+/// - **Undercounting used to be fatal.** An allow-list of known tag names
+///   missed `<big>`, `<dfn>` and custom elements, and treated `<div/>` as
+///   self-closing, which HTML does not. Deep documents therefore sailed past
+///   the guard. (The renderer no longer recurses, so this is now a
+///   performance bound rather than a safety one — but html5ever is quadratic
+///   in depth, so it still has to be right.)
+/// - **Overcounting rejects real pages.** A `<` inside minified JavaScript or
+///   inside a quoted attribute value is not a tag, so raw-text elements are
+///   skipped wholesale and attribute values are stepped over.
+///
+/// `/>` self-closes only inside foreign content (`<svg>`, `<math>`); in HTML
+/// proper, `<div/>` opens a `div` like any other start tag.
 pub fn max_nesting_depth(html: &str) -> usize {
-    /// Elements that must be closed explicitly, and that nest arbitrarily.
-    const COUNTED: &[&str] = &[
-        "div",
-        "span",
-        "section",
-        "article",
-        "aside",
-        "nav",
-        "header",
-        "footer",
-        "main",
-        "table",
-        "tbody",
-        "thead",
-        "ul",
-        "ol",
-        "dl",
-        "blockquote",
-        "form",
-        "fieldset",
-        "figure",
-        "details",
-        "a",
-        "b",
-        "i",
-        "u",
-        "s",
-        "em",
-        "strong",
-        "small",
-        "sub",
-        "sup",
-        "font",
-        "center",
-        "pre",
-        "code",
-        "label",
-        "iframe",
-        "svg",
-        "g",
-        "q",
-        "cite",
-        "abbr",
-        "address",
-        "marquee",
-        "video",
-        "audio",
-        "canvas",
-        "picture",
-        "template",
-        "button",
-        "select",
-    ];
-
     let bytes = html.as_bytes();
     let mut depth: usize = 0;
     let mut max = 0usize;
     let mut i = 0usize;
+    // Depth at which the current foreign-content subtree began, if any.
+    let mut foreign_from: Option<usize> = None;
+
     while i < bytes.len() {
         if bytes[i] != b'<' {
             i += 1;
@@ -292,35 +300,91 @@ pub fn max_nesting_depth(html: &str) -> usize {
             };
             continue;
         }
+
         let closing = after[0] == b'/';
-        let name_start = if closing { 1 } else { 0 };
+        let name_start = usize::from(closing);
         let name: String = after[name_start..]
             .iter()
-            .take_while(|c| c.is_ascii_alphanumeric())
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
             .map(|c| c.to_ascii_lowercase() as char)
             .collect();
-        if name.is_empty() || !COUNTED.contains(&name.as_str()) {
-            i += 1;
+        if name.is_empty() {
+            i += 1; // a stray '<' in text
             continue;
         }
+
+        let attrs_at = name_start + name.len();
+        let Some(tag_len) = tag_end(&after[attrs_at..]) else {
+            break; // unterminated tag
+        };
+        let self_closing = after[..attrs_at + tag_len]
+            .iter()
+            .rev()
+            .find(|c| !c.is_ascii_whitespace())
+            == Some(&b'/');
+        // Advance past `<`, the name, the attributes and the closing `>`.
+        i += 1 + attrs_at + tag_len + 1;
+
         if closing {
-            depth = depth.saturating_sub(1);
-        } else {
-            // A self-closing `<svg ... />` opens nothing.
-            let tag_end = after.iter().position(|&c| c == b'>').unwrap_or(after.len());
-            let self_closing = after[..tag_end]
-                .iter()
-                .rev()
-                .find(|c| !c.is_ascii_whitespace())
-                == Some(&b'/');
-            if !self_closing {
-                depth += 1;
-                max = max.max(depth);
+            if foreign_from == Some(depth.saturating_sub(1))
+                && matches!(name.as_str(), "svg" | "math")
+            {
+                foreign_from = None;
             }
+            depth = depth.saturating_sub(1);
+            continue;
         }
-        i += 1;
+
+        // Raw text: skip to the matching end tag so its contents cannot be
+        // mistaken for markup.
+        if RAW_TEXT.contains(&name.as_str()) && !self_closing {
+            let close = format!("</{name}");
+            match find_sub_ci(&bytes[i..], close.as_bytes()) {
+                Some(rel) => i += rel,
+                None => break,
+            }
+            continue;
+        }
+        if VOID_ELEMENTS.contains(&name.as_str()) || AUTO_CLOSING.contains(&name.as_str()) {
+            continue;
+        }
+        // `/>` closes a tag only in foreign content.
+        if self_closing && foreign_from.is_some() {
+            continue;
+        }
+        if foreign_from.is_none() && matches!(name.as_str(), "svg" | "math") {
+            foreign_from = Some(depth);
+        }
+        depth += 1;
+        max = max.max(depth);
     }
     max
+}
+
+/// Offset of the `>` that ends a tag, skipping over quoted attribute values.
+fn tag_end(after_name: &[u8]) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, &c) in after_name.iter().enumerate() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            // A '>' inside an attribute value does not end the tag.
+            None if c == b'>' => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
+/// ASCII-case-insensitive substring search.
+fn find_sub_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Index of the first occurrence of `needle` in `haystack`.
@@ -457,65 +521,114 @@ fn text_len(node: &NodeRef<'_, Node>) -> usize {
 
 const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 
-/// Recursive renderer: text nodes as-is; elements by tag semantics.
+/// One unit of pending work for the renderer.
+enum Step<'a> {
+    /// Render this node (and schedule its children).
+    Enter(NodeRef<'a, Node>),
+    /// Append a fixed string once a subtree is finished.
+    Emit(&'static str),
+    /// Close a markdown link: trim what the subtree produced, then append
+    /// `](href)`. `start` is where the link text began in the output buffer.
+    CloseLink { start: usize, href: String },
+}
+
+/// Renderer: text nodes as-is; elements by tag semantics.
 ///
-/// Recursion is safe because [`max_nesting_depth`] has already rejected
-/// documents deeper than [`MAX_NESTING_DEPTH`].
-fn walk(node: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
-    match node.value() {
-        Node::Text(t) => out.push_str(&t.text),
-        Node::Element(e) => {
-            let tag = e.name();
-            if is_excluded(tag, e) {
-                return;
+/// **Iterative on purpose.** This walks attacker-supplied markup, and a
+/// recursive version overflows the stack on a deeply nested page. A stack
+/// overflow aborts the process rather than unwinding, so `catch_unwind` in the
+/// batch worker cannot contain it: one hostile URL would take down the whole
+/// run. An explicit stack makes depth a heap concern instead.
+fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
+    let mut stack = vec![Step::Enter(root)];
+
+    while let Some(step) = stack.pop() {
+        let node = match step {
+            Step::Emit(s) => {
+                out.push_str(s);
+                continue;
             }
-            if markdown && tag == "a" {
-                if let Some(href) = e.attr("href") {
-                    let mut inner = String::new();
-                    for child in node.children() {
-                        walk(child, &mut inner, true);
-                    }
-                    if !inner.trim().is_empty() {
+            Step::CloseLink { start, href } => {
+                let trimmed = out[start..].trim().to_string();
+                out.truncate(start);
+                if trimmed.is_empty() {
+                    // No link text: drop the '[' we optimistically emitted.
+                    out.pop();
+                } else {
+                    out.push_str(&trimmed);
+                    out.push_str("](");
+                    out.push_str(&href);
+                    out.push(')');
+                }
+                continue;
+            }
+            Step::Enter(node) => node,
+        };
+
+        match node.value() {
+            Node::Text(t) => out.push_str(&t.text),
+            Node::Element(e) => {
+                let tag = e.name();
+                if is_excluded(tag, e) {
+                    continue;
+                }
+
+                // Schedule the closing work first: the stack is LIFO, so it
+                // runs after every child has been rendered.
+                let mut linked = false;
+                if markdown && tag == "a" {
+                    if let Some(href) = e.attr("href") {
                         out.push('[');
-                        out.push_str(inner.trim());
-                        out.push(']');
-                        out.push('(');
-                        out.push_str(href);
-                        out.push(')');
-                        return;
+                        stack.push(Step::CloseLink {
+                            start: out.len(),
+                            href: href.to_string(),
+                        });
+                        linked = true;
+                    }
+                }
+                if !linked {
+                    if let Some(suffix) = block_suffix(tag) {
+                        stack.push(Step::Emit(suffix));
+                    }
+                }
+
+                for child in node.children().collect::<Vec<_>>().into_iter().rev() {
+                    stack.push(Step::Enter(child));
+                }
+
+                if markdown && !linked {
+                    // Opening markers go straight to the buffer: the children
+                    // are only rendered on later iterations, so writing now
+                    // still puts the marker in front of them.
+                    if let Some(level) = HEADINGS.iter().position(|h| *h == tag) {
+                        out.push_str(&"#".repeat(level + 1));
+                        out.push(' ');
+                    } else if tag == "li" {
+                        out.push_str("- ");
+                    } else if tag == "blockquote" {
+                        out.push_str("> ");
                     }
                 }
             }
-            if markdown {
-                // Emit real markdown block markers, not just line breaks:
-                // `--markdown` promises headings *and lists*.
-                if let Some(level) = HEADINGS.iter().position(|h| *h == tag) {
-                    out.push_str(&"#".repeat(level + 1));
-                    out.push(' ');
-                } else if tag == "li" {
-                    out.push_str("- ");
-                } else if tag == "blockquote" {
-                    out.push_str("> ");
-                }
-            }
-            for child in node.children() {
-                walk(child, out, markdown);
-            }
-            match tag {
-                "p" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "blockquote"
-                | "tr" | "br" | "dt" | "dd" => out.push('\n'),
-                // Table cells keep their column separator in both modes; a
-                // markdown reader loses the table otherwise.
-                "td" | "th" => out.push_str(" | "),
-                _ => {}
-            }
+            Node::Document
+            | Node::Fragment
+            | Node::Comment(_)
+            | Node::Doctype(_)
+            | Node::ProcessingInstruction(_) => {}
         }
-        Node::Document
-        | Node::Fragment
-        | Node::Comment(_)
-        | Node::Doctype(_)
-        | Node::ProcessingInstruction(_) => {}
     }
+}
+
+/// Line/cell separator emitted after an element, in both output modes.
+fn block_suffix(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "p" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "blockquote" | "tr"
+        | "br" | "dt" | "dd" => "\n",
+        // Table cells keep their column separator in both modes; a markdown
+        // reader loses the table otherwise.
+        "td" | "th" => " | ",
+        _ => return None,
+    })
 }
 
 /// Collapse blank runs, trim trailing whitespace per line.
@@ -658,9 +771,73 @@ mod tests {
         // Unclosed <p>/<li> are repaired by the parser and must not inflate.
         assert_eq!(max_nesting_depth(&"<p>text".repeat(5_000)), 0);
         assert_eq!(max_nesting_depth(&"<li>item".repeat(5_000)), 0);
-        // Self-closing tags open nothing.
-        assert_eq!(max_nesting_depth("<div><svg /></div>"), 1);
+        // Void elements and comment contents open nothing.
         assert_eq!(max_nesting_depth("<!-- <div><div> --><br><img>"), 0);
+    }
+
+    #[test]
+    fn depth_guard_counts_tags_outside_any_allow_list() {
+        // An allow-list of known tag names missed these entirely, so a deep
+        // document walked straight past the guard.
+        for tag in ["big", "dfn", "mark", "kbd", "my-widget", "object"] {
+            let html = format!(
+                "{}x{}",
+                format!("<{tag}>").repeat(50),
+                format!("</{tag}>").repeat(50)
+            );
+            assert_eq!(max_nesting_depth(&html), 50, "tag <{tag}> was not counted");
+        }
+        // HTML has no self-closing syntax for ordinary elements: `<div/>`
+        // opens a div, and 50 of them nest 50 deep.
+        assert_eq!(max_nesting_depth(&"<div/>".repeat(50)), 50);
+    }
+
+    #[test]
+    fn depth_guard_ignores_angle_brackets_that_are_not_tags() {
+        // Minified JavaScript is full of `<`; counting those rejected pages
+        // that are perfectly ordinary.
+        let js = "for(var i=0;i<a.length;i++){if(i<b.length&&i<s.length){x=i<u.length}}";
+        let html = format!(
+            "<html><body><script>{}</script><p>hi</p></body></html>",
+            js.repeat(200)
+        );
+        assert_eq!(
+            max_nesting_depth(&html),
+            2,
+            "script contents are not markup"
+        );
+
+        // Nor is a '<' or '>' inside a quoted attribute value.
+        assert_eq!(
+            max_nesting_depth(r#"<div title="a > b < c"><span></span></div>"#),
+            2
+        );
+        assert_eq!(max_nesting_depth("<p>if x < y then</p>"), 0);
+    }
+
+    #[test]
+    fn self_closing_is_honoured_only_in_foreign_content() {
+        // Inline SVG uses real self-closing syntax; without this an icon set
+        // would look like hundreds of nested elements.
+        let svg = format!("<div><svg>{}</svg></div>", "<path/>".repeat(500));
+        assert_eq!(max_nesting_depth(&svg), 2);
+    }
+
+    #[test]
+    fn deeply_nested_input_cannot_overflow_the_stack() {
+        // The renderer is iterative precisely so this cannot abort the
+        // process: a stack overflow does not unwind, so the batch worker's
+        // catch_unwind could never have contained it.
+        let d = 100_000;
+        let html = format!(
+            "<article>{}deep{}</article>",
+            "<b>".repeat(d),
+            "</b>".repeat(d)
+        );
+        let doc = Html::parse_document(&html);
+        let mut out = String::new();
+        walk(*doc.root_element(), &mut out, false);
+        assert!(out.contains("deep"));
     }
 
     #[test]
@@ -705,6 +882,27 @@ mod tests {
         headerless.extend_from_slice(&sjis);
         headerless.extend_from_slice(b"</title></head><body></body></html>");
         assert!(decode_body(&headerless, Some("Shift_JIS")).contains("日本語"));
+    }
+
+    #[test]
+    fn http_equiv_content_type_declares_the_charset() {
+        // The word "charset" also appears inside the quoted `content` value,
+        // which used to match first and yield the label `shift_jis"`.
+        let sjis: Vec<u8> = vec![0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea];
+        for meta in [
+            b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=shift_jis\">".to_vec(),
+            b"<meta http-equiv='Content-Type' content='text/html; charset=shift_jis'>".to_vec(),
+            b"<meta http-equiv=Content-Type content=text/html;charset=shift_jis>".to_vec(),
+        ] {
+            let mut body = b"<html><head>".to_vec();
+            body.extend_from_slice(&meta);
+            body.extend_from_slice(b"<title>");
+            body.extend_from_slice(&sjis);
+            body.extend_from_slice(b"</title></head><body></body></html>");
+            let decoded = decode_body(&body, None);
+            assert!(decoded.contains("日本語"), "not decoded: {decoded}");
+            assert!(!decoded.contains('\u{fffd}'), "mojibake: {decoded}");
+        }
     }
 
     #[test]

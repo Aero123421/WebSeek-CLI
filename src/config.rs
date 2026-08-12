@@ -200,7 +200,12 @@ impl Config {
              # contact_email is optional but recommended: OpenAlex and NCBI ask\n\
              # for a contact address, and supplying a real one is the difference\n\
              # between being a good citizen and pretending to be one.\n\n\
-             {}\n",
+             {}\n\
+             # Optional keys. serde omits unset values, and TOML has no `null`,\n\
+             # so they appear here as comments rather than as empty settings.\n\
+             # contact_email = \"you@example.com\"\n\
+             # lang = \"ja\"          # engine-dependent\n\
+             # region = \"jp\"        # or \"en-us\", \"EN_US\", ...\n",
             toml::to_string_pretty(&TomlConfig::default())
                 .map_err(|e| Error::Config(e.to_string()))?
         );

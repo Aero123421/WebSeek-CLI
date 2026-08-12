@@ -7,14 +7,15 @@
 //! blocking client owns a runtime).
 
 use reqwest::blocking::Client;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use webseek::engines::bing::Bing;
 use webseek::engines::duckduckgo::DuckDuckGo;
 use webseek::engines::images::{BingImages, DuckDuckGoImages};
+use webseek::engines::wikipedia::Wikipedia;
 use webseek::engines::{ImageEngine, SearchEngine};
-use webseek::models::SearchOpts;
+use webseek::models::{ImageOpts, SearchOpts};
 
 const DDG_HTML: &str = r#"<html><body>
   <div class="result">
@@ -54,6 +55,13 @@ fn client() -> Client {
 
 fn opts() -> SearchOpts {
     SearchOpts {
+        count: 5,
+        ..Default::default()
+    }
+}
+
+fn image_opts() -> ImageOpts {
+    ImageOpts {
         count: 5,
         ..Default::default()
     }
@@ -150,7 +158,7 @@ fn bing_images_engine_full_pipeline() {
     let base = format!("{}/images/search", server.uri());
 
     let engine = BingImages::with_base(base);
-    let results = engine.search(&client(), "cats", 5, false).unwrap();
+    let results = engine.search(&client(), "cats", &image_opts()).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].url, "https://cdn.example.com/pic.jpg");
@@ -181,12 +189,137 @@ fn duckduckgo_images_engine_full_pipeline() {
     let page_base = server.uri();
 
     let engine = DuckDuckGoImages::with_bases(page_base, json_base);
-    let results = engine.search(&client(), "cats", 5, false).unwrap();
+    let results = engine.search(&client(), "cats", &image_opts()).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].url, "https://cdn.example.com/ddg.jpg");
     assert_eq!(results[0].height, Some(200));
     assert_eq!(results[0].format, "jpg");
+}
+
+/// The browser-like header set is one of the two documented anti-bot levers,
+/// and nothing verified it reached the wire — `build_client`'s own test only
+/// checked that the builder returns Ok.
+///
+/// Asserted against the recorded request rather than with `header()`
+/// matchers: wiremock splits comma-separated values, so a single
+/// `accept-language: en-US,en;q=0.9` never matches as one value.
+#[test]
+fn browser_headers_reach_the_server() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_HTML))
+            .mount(&server)
+            .await;
+    });
+    let client =
+        webseek::http::build_client(std::time::Duration::from_secs(10), "webseek-header-test")
+            .unwrap();
+    let engine = DuckDuckGo::with_base(format!("{}/html/", server.uri()));
+    assert_eq!(engine.search(&client, "rust", &opts()).unwrap().len(), 2);
+
+    let requests = rt.block_on(server.received_requests()).unwrap();
+    let sent = &requests.first().expect("one request was made").headers;
+    for (name, expected) in [
+        ("user-agent", "webseek-header-test"),
+        ("accept-language", "en-US,en;q=0.9"),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("upgrade-insecure-requests", "1"),
+    ] {
+        let got = sent
+            .get(name)
+            .unwrap_or_else(|| panic!("header {name} was never sent"));
+        assert_eq!(got, expected, "header {name}");
+    }
+    assert!(
+        sent.get("accept")
+            .is_some_and(|v| v.to_str().unwrap().contains("text/html")),
+        "the Accept header is part of the anti-bot lever too"
+    );
+}
+
+/// Official APIs must receive webseek's honest identification, not the
+/// browser string — the whole point of the user-agent policy.
+#[test]
+fn api_engines_identify_themselves_rather_than_impersonating_a_browser() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(header(
+                "user-agent",
+                "webseek/test (+contact: me@example.com)",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"query":{"search":[{"title":"Rust","snippet":"s"}]}}"#),
+            )
+            .mount(&server)
+            .await;
+    });
+    let opts = SearchOpts {
+        api_user_agent: "webseek/test (+contact: me@example.com)".into(),
+        ..Default::default()
+    };
+    let engine = Wikipedia::with_base(format!("{}/w/api.php", server.uri()));
+    assert_eq!(
+        engine.search(&client(), "rust", &opts).unwrap().len(),
+        1,
+        "the mock only answers requests carrying the API user-agent"
+    );
+
+    // The browser client default must not leak through on that path.
+    let browser = webseek::http::build_client(
+        std::time::Duration::from_secs(10),
+        webseek::config::DEFAULT_USER_AGENT,
+    )
+    .unwrap();
+    assert_eq!(engine.search(&browser, "rust", &opts).unwrap().len(), 1);
+}
+
+/// `Retry-After` is honoured in preference to our own backoff.
+#[test]
+fn retry_after_header_is_obeyed() {
+    use std::time::Instant;
+
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        // Mounted FIRST: wiremock answers with the earliest matching mock, and
+        // an exhausted `up_to_n_times` stops matching, so the 200 below picks
+        // up the retry.
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_HTML))
+            .mount(&server)
+            .await;
+    });
+    let engine = DuckDuckGo::with_base(format!("{}/html/", server.uri()));
+    let start = Instant::now();
+    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let waited = start.elapsed();
+
+    assert_eq!(results.len(), 2, "the retry must eventually succeed");
+    assert_eq!(
+        rt.block_on(server.received_requests()).unwrap().len(),
+        2,
+        "the 503 must actually have been served, or this proves nothing"
+    );
+    // The default backoff for attempt 0 is jittered within [0, 400ms]; waiting
+    // a full second is only explicable by the header.
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "Retry-After was ignored (waited {waited:?})"
+    );
 }
 
 #[test]
@@ -240,17 +373,19 @@ fn search_recovers_after_transient_500_via_retry() {
     let rt = setup_runtime();
     let server = rt.block_on(MockServer::start());
     rt.block_on(async {
-        // 200 for all requests, but a higher-precedence 500 mock answers the
-        // first request only; the retry loop must ride it out and succeed.
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_HTML))
-            .mount(&server)
-            .await;
+        // Order matters: wiremock serves the first matching mock, so the
+        // transient failure has to be mounted ahead of the success. Mounted
+        // the other way round the 500 never fired at all and this test passed
+        // without a single retry taking place.
         Mock::given(method("GET"))
             .and(path("/html/"))
             .respond_with(ResponseTemplate::new(500))
             .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_HTML))
             .mount(&server)
             .await;
     });
@@ -261,4 +396,9 @@ fn search_recovers_after_transient_500_via_retry() {
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].url, "https://example.com/1");
+    assert_eq!(
+        rt.block_on(server.received_requests()).unwrap().len(),
+        2,
+        "the retry path was never exercised"
+    );
 }

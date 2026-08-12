@@ -189,8 +189,9 @@ mod tests {
 
     #[test]
     fn build_client_succeeds_with_a_custom_agent() {
-        // Header *content* is asserted end-to-end in tests/engines.rs against
-        // the mock server; here we only guarantee the builder is well-formed.
+        // Header *content* is asserted on the wire by
+        // `tests::engines::browser_headers_reach_the_server`; this only
+        // guarantees the builder itself is well-formed.
         assert!(build_client(Duration::from_secs(5), "ua-test").is_ok());
         assert!(build_client(Duration::from_secs(5), "").is_ok());
     }

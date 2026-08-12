@@ -34,7 +34,7 @@ fn jobs_parser() -> RangedU64ValueParser<usize> {
 \n\
 Exit codes:\n\
   0  success (including \"no results\": empty JSON is valid)\n\
-  1  runtime error (network / parse / config)\n\
+  1  runtime error (network / parse / config / rate limit / robots)\n\
   2  CLI usage error\n\
 \n\
 Machine-friendly by default: when stdout is piped, output is JSON."

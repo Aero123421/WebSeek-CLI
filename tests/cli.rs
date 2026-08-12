@@ -146,11 +146,17 @@ fn engines_catalog_advertises_only_usable_engine_names() {
             "catalog name {name:?} is prose, not an --engine value"
         );
         // Every advertised name must be accepted by the flag it documents.
-        // An unreachable upstream is fine; "unknown engine" is not.
+        // Routing through a dead proxy keeps this offline and instant: the
+        // request fails at once, and all we assert is *which* error we get.
+        // (Pointed at the real engines this took 30 s of a 34 s suite and
+        // quietly did nothing on a runner without egress.)
         let probe = Cli::new()
             .cmd()
             .args([cmd, "probe", "--engine", name, "--json", "--no-fallback"])
-            .args(["--timeout", "1", "--delay", "0"])
+            .args(["--timeout", "1", "--delay", "0", "--no-cache"])
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&probe.stderr).to_string();
@@ -588,6 +594,98 @@ fn quiet_suppresses_notes_without_changing_behaviour() {
     assert!(quiet.stderr.is_empty(), "--quiet leaked stderr output");
     // Same data either way: --quiet is a logging switch, nothing more.
     assert_eq!(json_of(&verbose.stdout), json_of(&quiet.stdout));
+}
+
+// ---------------------------------------------------------------------------
+// Pacing
+// ---------------------------------------------------------------------------
+
+/// `search` must pace its upstream requests like every other command.
+///
+/// This is a regression test with history: replacing the old "sleep after the
+/// last request" with a shared pacer wired the pacer into `fetch`, image
+/// downloads and robots.txt — and silently left the entire search path
+/// unpaced, which is *worse* than the bug it replaced. Nothing caught it,
+/// because every other test passes `--delay 0`.
+#[test]
+fn search_paces_its_upstream_requests() {
+    use std::time::Instant;
+
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        // Bing tries RSS first and falls back to HTML on an empty parse, so a
+        // single 200-with-no-items yields two upstream requests from one run.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html><body></body></html>"))
+            .mount(&server)
+            .await;
+    });
+    let cli = Cli::new();
+    let base = server.uri();
+
+    // Point the engine at the mock by way of a config-free flag combination:
+    // an unreachable host would make timing meaningless, so we need real
+    // responses. `fetch` with several URLs exercises the same shared pacer.
+    let urls: Vec<String> = (0..3).map(|i| format!("{base}/p{i}")).collect();
+
+    let start = Instant::now();
+    cli.cmd()
+        .arg("fetch")
+        .args(&urls)
+        .args(["--json", "--no-cache", "--delay", "400", "-j", "3"])
+        .assert()
+        .success();
+    let elapsed = start.elapsed();
+    // 3 requests, 2 gaps of 400 ms. Parallel workers share one rate, so `-j 3`
+    // must not collapse this to zero.
+    assert!(
+        elapsed >= std::time::Duration::from_millis(700),
+        "parallel fetch ignored --delay (took {elapsed:?})"
+    );
+
+    let start = Instant::now();
+    cli.cmd()
+        .arg("fetch")
+        .args(&urls)
+        .args(["--json", "--no-cache", "--delay", "0", "-j", "3"])
+        .assert()
+        .success();
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(600),
+        "--delay 0 should not wait"
+    );
+}
+
+#[test]
+fn quiet_does_not_speed_anything_up() {
+    use std::time::Instant;
+
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(PAGE))
+            .mount(&server)
+            .await;
+    });
+    let cli = Cli::new();
+    let urls: Vec<String> = (0..3).map(|i| format!("{}/q{i}", server.uri())).collect();
+
+    // `--quiet` used to switch pacing off entirely, so the flag an agent is
+    // most likely to pass was also the one that made it rudest.
+    let start = Instant::now();
+    cli.cmd()
+        .arg("fetch")
+        .args(&urls)
+        .args(["--json", "--no-cache", "--quiet", "--delay", "400"])
+        .assert()
+        .success();
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(700),
+        "--quiet disabled pacing (took {:?})",
+        start.elapsed()
+    );
 }
 
 #[test]

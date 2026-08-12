@@ -51,7 +51,8 @@ impl SearchEngine for DuckDuckGo {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send(client.get(url))
             .map_err(|e| Error::Network(format!("duckduckgo request failed: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {

@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::engines::{dedupe_and_truncate, ImageEngine};
 use crate::error::{Error, Result};
-use crate::models::ImageResult;
+use crate::models::{ImageOpts, ImageResult};
 use crate::pace::Pacer;
 use crate::robots::RobotsChecker;
 use crate::text::sanitize_name;
@@ -79,21 +79,16 @@ impl ImageEngine for BingImages {
         "bing"
     }
 
-    fn search(
-        &self,
-        client: &Client,
-        query: &str,
-        count: usize,
-        safe: bool,
-    ) -> Result<Vec<ImageResult>> {
+    fn search(&self, client: &Client, query: &str, opts: &ImageOpts) -> Result<Vec<ImageResult>> {
         let mut params = vec![("q", query), ("form", "HDRSC2")];
-        if safe {
+        if opts.safe {
             params.push(("adlt", "strict"));
         }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send(client.get(url))
             .map_err(|e| Error::Network(format!("bing images request failed: {e}")))?;
         let status = resp.status();
         if matches!(status.as_u16(), 202 | 403 | 429) {
@@ -112,9 +107,11 @@ impl ImageEngine for BingImages {
                 "bing images served a bot-challenge page instead of results".into(),
             ));
         }
-        Ok(dedupe_and_truncate(parse_bing_html(&body), count, |r| {
-            &r.url
-        }))
+        Ok(dedupe_and_truncate(
+            parse_bing_html(&body),
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -123,22 +120,19 @@ impl ImageEngine for DuckDuckGoImages {
         "duckduckgo"
     }
 
-    fn search(
-        &self,
-        client: &Client,
-        query: &str,
-        count: usize,
-        safe: bool,
-    ) -> Result<Vec<ImageResult>> {
-        let vqd = fetch_vqd(client, query, safe, &self.page_base)?;
+    fn search(&self, client: &Client, query: &str, opts: &ImageOpts) -> Result<Vec<ImageResult>> {
+        // Two upstream requests: the token page, then the JSON endpoint. Both
+        // are paced, which is exactly why the pacer lives in the opts.
+        let vqd = fetch_vqd(client, query, opts, &self.page_base)?;
         let mut params = vec![("q", query), ("o", "json"), ("vqd", vqd.as_str())];
-        if safe {
+        if opts.safe {
             params.push(("p", "1"));
         }
         let url = Url::parse_with_params(&self.json_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send(client.get(url))
             .map_err(|e| Error::Network(format!("duckduckgo images request failed: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
@@ -150,21 +144,24 @@ impl ImageEngine for DuckDuckGoImages {
             return Err(Error::Http(status.as_u16()));
         }
         let body = resp.text().map_err(Error::from)?;
-        Ok(dedupe_and_truncate(parse_ddg_json(&body)?, count, |r| {
-            &r.url
-        }))
+        Ok(dedupe_and_truncate(
+            parse_ddg_json(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
 /// Grab the one-time `vqd` token DDG requires for its image JSON API.
-fn fetch_vqd(client: &Client, query: &str, safe: bool, page_base: &str) -> Result<String> {
+fn fetch_vqd(client: &Client, query: &str, opts: &ImageOpts, page_base: &str) -> Result<String> {
     let mut params = vec![("q", query), ("iax", "images"), ("ia", "images")];
-    if safe {
+    if opts.safe {
         params.push(("p", "1"));
     }
     let url = Url::parse_with_params(page_base, &params)
         .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-    let resp = crate::http::send_with_retry(&client.get(url))
+    let resp = opts
+        .send(client.get(url))
         .map_err(|e| Error::Network(format!("duckduckgo vqd request failed: {e}")))?;
     let status = resp.status();
     if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {

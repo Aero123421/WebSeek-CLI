@@ -4,7 +4,13 @@
 //! Field names are kept short and stable: adding a field is fine, renaming
 //! is a breaking change.
 
+use std::sync::Arc;
+
+use reqwest::blocking::{RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+use crate::pace::Pacer;
 
 /// One text search hit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +49,12 @@ pub struct FetchResult {
 }
 
 /// Options passed to a search engine.
+///
+/// Carries the shared [`Pacer`], so *sending a request at all* goes through
+/// politeness control. Engines issue a varying number of requests — Bing tries
+/// RSS then HTML, PubMed does esearch then esummary, DuckDuckGo images fetches
+/// a token first — so pacing at the call site in `lib.rs` would only ever
+/// cover the first one.
 #[derive(Debug, Clone)]
 pub struct SearchOpts {
     pub count: usize,
@@ -54,11 +66,14 @@ pub struct SearchOpts {
     /// Those endpoints ask, in their usage policies, to be told who is calling.
     /// Scraped endpoints keep the browser-like agent from the client, because
     /// they serve challenge pages to anything that looks automated; APIs get
-    /// the truth. See `config::api_user_agent`.
+    /// the truth. See `config::api_user_agent`. An explicit `--ua` overrides
+    /// this as well, so the flag means what its help text says.
     pub api_user_agent: String,
     /// Contact address for APIs with a "polite pool" (OpenAlex, NCBI).
     /// `None` means webseek makes no claim about who is calling.
     pub contact_email: Option<String>,
+    /// Shared minimum-interval limiter for every upstream request.
+    pub pacer: Arc<Pacer>,
 }
 
 impl Default for SearchOpts {
@@ -70,17 +85,54 @@ impl Default for SearchOpts {
             safe: false,
             api_user_agent: crate::config::api_user_agent(),
             contact_email: None,
+            pacer: Arc::new(Pacer::disabled()),
         }
     }
 }
 
 impl SearchOpts {
     /// Attach webseek's honest identification to an API request.
-    pub fn identify(
-        &self,
-        rb: reqwest::blocking::RequestBuilder,
-    ) -> reqwest::blocking::RequestBuilder {
+    pub fn identify(&self, rb: RequestBuilder) -> RequestBuilder {
         rb.header(reqwest::header::USER_AGENT, self.api_user_agent.as_str())
+    }
+
+    /// Send a request to a **scraped** endpoint: paced, then retried.
+    pub fn send(&self, rb: RequestBuilder) -> Result<Response> {
+        self.pacer.wait();
+        crate::http::send_with_retry(&rb)
+    }
+
+    /// Send a request to an **official API**: identified, paced, retried.
+    pub fn send_api(&self, rb: RequestBuilder) -> Result<Response> {
+        self.send(self.identify(rb))
+    }
+}
+
+/// Options passed to an image search engine.
+#[derive(Debug, Clone)]
+pub struct ImageOpts {
+    pub count: usize,
+    pub safe: bool,
+    /// Shared minimum-interval limiter for every upstream request.
+    pub pacer: Arc<Pacer>,
+}
+
+impl Default for ImageOpts {
+    fn default() -> Self {
+        Self {
+            count: 5,
+            safe: false,
+            pacer: Arc::new(Pacer::disabled()),
+        }
+    }
+}
+
+impl ImageOpts {
+    /// Both image engines scrape, so they keep the browser-like agent from the
+    /// client; only pacing and retries are applied here.
+    pub fn send(&self, rb: RequestBuilder) -> Result<Response> {
+        self.pacer.wait();
+        crate::http::send_with_retry(&rb)
     }
 }
 

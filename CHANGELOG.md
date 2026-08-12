@@ -33,8 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch on the failure class without parsing prose.
 - **`aliases`, `command` and `fallback` fields** on `webseek engines` output.
 - End-to-end CLI test suite (`tests/cli.rs`) covering exit codes, config
-  resolution, output shapes, robots override, pipes and caching — the layer
-  that previously had no tests at all.
+  resolution, output shapes, robots override, pipes, pacing and caching — the
+  layer that previously had no tests at all.
+- Behavioural coverage for the fallback chain itself, the cache-key builders,
+  concurrent cache writes, the browser header set on the wire, API
+  self-identification and `Retry-After`. Each was verified by mutation: revert
+  the fix and the test fails. Two pre-existing tests were doing nothing —
+  `keys_differ_by_options` never called the real key builders, and the
+  transient-500 retry test passed without any retry occurring, because
+  wiremock serves the *first* matching mock and the failure was mounted
+  second.
 - CI: an MSRV job that builds with the declared `rust-version`, a weekly
   scheduled `cargo-audit` run, and `--locked` on every cargo invocation.
 - `SECURITY.md`, issue templates and a pull-request template.
@@ -103,6 +111,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `strip_tags` ate text after a bare `<` (`if x < y`); `extract_tag("link")`
   matched `<linkedin>`; metadata joins left dangling `·` separators.
 - The default User-Agent advertised `webseek/0.1` regardless of the version.
+- **Deeply nested HTML could abort the process.** The nesting guard only
+  recognised 48 hard-coded tag names — `<big>`, `<dfn>`, custom elements and
+  `<div/>` all slipped past it — and the recursive renderer then overflowed
+  the stack. A stack overflow does not unwind, so the batch worker's
+  `catch_unwind` could not contain it: one hostile URL killed the whole run.
+  The renderer is now iterative, and the guard is a small tokenizer that also
+  stops counting `<` inside `<script>` and quoted attribute values (which used
+  to *reject* ordinary minified pages).
+- **`Crawl-delay` did not end a robots.txt user-agent group**, so a following
+  `User-agent: SomeBot` / `Disallow: /` was applied to us and blocked entire
+  sites. `Disallow: $` alone also matched every path.
+- **Bing redirect payloads containing `+` still leaked the tracking URL**:
+  reading the `u` parameter with `query_pairs()` form-decodes `+` to a space.
+- **`<meta http-equiv="Content-Type" content="…charset=…">` was ignored**,
+  because the word "charset" inside that quoted value matched first and
+  yielded a label with a stray quote.
+- **A rate limit could be reported as "no results".** When one engine came
+  back empty and another failed, the empty answer won and the command exited
+  0 with `count: 0`, hiding the failure.
+- `--ua` was a no-op for the eleven API-backed engines, which overrode it with
+  webseek's own agent.
+- The `webseek init` template omitted `contact_email`, `lang` and `region`
+  entirely (serde drops unset options), and the README's config block used
+  `null`, which is not valid TOML — so neither the generated file nor the
+  documented one was a working example.
 
 ### Changed
 

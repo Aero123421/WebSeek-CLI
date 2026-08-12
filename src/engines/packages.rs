@@ -69,7 +69,8 @@ impl SearchEngine for Crates {
         let params: Vec<(&str, &str)> = vec![("q", query), ("per_page", &limit)];
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("crates.io request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -172,7 +173,8 @@ impl SearchEngine for Npm {
         let params: Vec<(&str, &str)> = vec![("text", query), ("size", &limit)];
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("npm request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
@@ -270,7 +272,8 @@ impl SearchEngine for PyPi {
             crate::text::encode_path_segment(name)
         ))
         .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&opts.identify(client.get(url)))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pypi request failed: {e}")))?;
         let status = resp.status();
         if status.as_u16() == 404 {

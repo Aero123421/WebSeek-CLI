@@ -144,8 +144,9 @@ them), so piping is always safe:
 webseek search "rust macros" --json | jq .results[].url
 ```
 
-`--quiet` silences stderr and nothing else — it never changes pacing, caching
-or results.
+`--quiet` suppresses progress notes and warnings; errors are still reported on
+stderr. It changes logging and nothing else — never pacing, caching or
+results.
 
 ### Exit codes
 
@@ -175,12 +176,12 @@ you asked for when fallback kicked in — including on a cache hit.
 {"url":"https://...","title":"...","chars":12034,"truncated":false,"text":"..."}
 ```
 
-`images`:
+`images` — `downloaded` is present only when `--download` was passed, so test
+for the key rather than for a null:
 
 ```json
 {"query":"cats","engine":"bing","count":5,"results":[
-  {"title":"...","url":"https://cdn...","page_url":"https://...","width":1920,"height":1080,"format":"jpg"}],
- "downloaded":null}
+  {"title":"...","url":"https://cdn...","page_url":"https://...","width":1920,"height":1080,"format":"jpg"}]}
 ```
 
 `fetch` with multiple URLs (or `--array`) — a JSON **array**, input order
@@ -247,7 +248,10 @@ cannot pace separate processes, so add your own `sleep` if you loop in a shell.
   selectors stopped matching is the most common way these engines break.
   Verticals (`wikipedia`, `pubmed`, `crates`, …) never fall back to general web
   search: they answer a different question, and silently substituting one would
-  hand you results you cannot tell apart. Disable with `--no-fallback`.
+  hand you results you cannot tell apart. The two image engines are
+  interchangeable and do fall back to each other. `webseek engines --json`
+  reports this per engine as a `fallback` boolean. Disable with
+  `--no-fallback`.
 - **Resilient transport.** Requests to scraped endpoints carry browser-like
   headers to avoid tripping anti-bot challenges, and transient failures
   (202/429/5xx/network) are retried with exponential backoff + jitter. A
@@ -285,10 +289,7 @@ image_engine = "bing"     # image engine: bing | duckduckgo
 delay_ms = 300            # minimum pause *between* upstream requests
 timeout_secs = 15
 user_agent = "..."        # browser-like; used for scraped endpoints only
-contact_email = null      # optional; see "Engines & ethics"
 safe_search = false
-lang = null               # e.g. "ja" (engine-dependent)
-region = null             # flexible: "jp", "en-us", "EN_US" (normalized per engine)
 max_chars = 20000         # fetch text cap (CLI --max-chars wins)
 max_results = 5           # result count (CLI --count wins)
 cache_ttl_secs = 3600     # response cache TTL (0 = never expire)
@@ -296,7 +297,15 @@ cache_max_entries = 1000  # response cache size (0 = disabled)
 fallback = true           # auto-switch web engine on failure/empty results
 respect_robots = false    # honor robots.txt before fetching
 image_max_bytes = 5242880 # skip downloaded images larger than this
+
+# Optional — omit the key entirely to leave it unset. TOML has no `null`,
+# so these are commented out rather than given a null value.
+# contact_email = "you@example.com"  # see "Engines & ethics"
+# lang = "ja"                        # engine-dependent
+# region = "jp"                      # flexible: "jp", "en-us", "EN_US"
 ```
+
+This block is exactly what `webseek init` writes, and it parses as-is.
 
 Unknown keys are rejected, so a typo is reported instead of ignored.
 

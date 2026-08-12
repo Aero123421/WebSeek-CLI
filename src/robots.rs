@@ -82,8 +82,10 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
         let last = i == segments.len() - 1;
 
         if seg.is_empty() {
-            if last && anchored {
-                // Trailing "*$" — anything up to the end matches.
+            // Trailing "*$" — anything up to the end matches. Guarded on
+            // `segments.len() > 1`, because a bare "$" produces one empty
+            // segment and must match only the empty path, not everything.
+            if last && anchored && segments.len() > 1 {
                 return true;
             }
             continue;
@@ -167,8 +169,11 @@ pub fn parse_robots(body: &str) -> RobotsRules {
                     allow: key == "allow",
                 });
             }
-            // sitemap / crawl-delay / unknown fields do not end a group.
-            _ => {}
+            // Any other field ends the run of User-agent lines. `Crawl-delay`
+            // is the common case: without this, a following
+            // `User-agent: SomeOtherBot` was folded into the `*` group and its
+            // `Disallow: /` applied to us, blocking the entire site.
+            _ => collecting_agents = false,
         }
     }
     rules
@@ -276,6 +281,32 @@ mod tests {
         // Reversed order must behave identically.
         let body = "User-agent: googlebot\nUser-agent: *\nDisallow: /x\n";
         assert!(!parse_robots(body).is_allowed("/x/1"));
+    }
+
+    #[test]
+    fn crawl_delay_ends_the_user_agent_run() {
+        // A very common shape. If `Crawl-delay` does not close the run of
+        // User-agent lines, the next bot's group is folded into ours and its
+        // `Disallow: /` blocks the entire site for us.
+        let body = "User-agent: *\nCrawl-delay: 10\n\nUser-agent: SemrushBot\nDisallow: /\n";
+        let rules = parse_robots(body);
+        assert!(
+            rules.is_allowed("/article"),
+            "another bot's Disallow was applied to us"
+        );
+        assert_eq!(rules.len(), 0, "we have no rules in this file");
+    }
+
+    #[test]
+    fn a_bare_dollar_matches_only_the_empty_path() {
+        let rules = parse_robots("User-agent: *\nDisallow: $\n");
+        assert!(
+            rules.is_allowed("/x"),
+            "`Disallow: $` must not block the site"
+        );
+        assert!(rules.is_allowed("/"));
+        assert!(!pattern_matches("$", "/x"));
+        assert!(pattern_matches("$", ""));
     }
 
     #[test]

@@ -147,8 +147,22 @@ impl Ctx<'_> {
             lang: lang.clone().or_else(|| self.cfg.lang.clone()),
             region: region.clone().or_else(|| self.cfg.region.clone()),
             safe: safe || self.cfg.safe_search,
-            api_user_agent: config::api_user_agent_with_contact(self.cfg.contact_email.as_deref()),
+            // `--ua` overrides the API agent too. The flag says "override the
+            // User-Agent header"; honouring it on scraped endpoints only would
+            // silently make it a no-op for eleven of the thirteen engines.
+            api_user_agent: self.cli.ua.clone().unwrap_or_else(|| {
+                config::api_user_agent_with_contact(self.cfg.contact_email.as_deref())
+            }),
             contact_email: self.cfg.contact_email.clone(),
+            pacer: self.pacer.clone(),
+        }
+    }
+
+    fn image_opts(&self, count: usize, safe: bool) -> models::ImageOpts {
+        models::ImageOpts {
+            count,
+            safe,
+            pacer: self.pacer.clone(),
         }
     }
 }
@@ -303,7 +317,7 @@ fn summarize_batch(ctx: &Ctx<'_>, items: &[BatchItem]) {
 /// never fired for the failure it most needed to cover. If *every* engine
 /// agrees there is nothing, that is a real zero-result answer (exit 0).
 fn try_engines<T>(
-    ctx: &Ctx<'_>,
+    trace: &dyn Fn(&str),
     order: &[&'static str],
     mut attempt: impl FnMut(&'static str) -> error::Result<(Vec<T>, &'static str)>,
 ) -> Result<(Vec<T>, &'static str)> {
@@ -316,7 +330,7 @@ fn try_engines<T>(
             Ok((_, used)) => {
                 empty_from.get_or_insert(used);
                 if order.len() > 1 {
-                    ctx.trace(&format!(
+                    trace(&format!(
                         "{used} returned no results, trying the next engine"
                     ));
                 }
@@ -325,16 +339,28 @@ fn try_engines<T>(
                 if !e.is_engine_retryable() {
                     return Err(e.into());
                 }
-                ctx.trace(&format!("{name} failed ({e})"));
+                trace(&format!("{name} failed ({e})"));
                 last_err = Some(e);
             }
         }
     }
 
+    resolve_outcome(empty_from, last_err)
+}
+
+/// Decide what an exhausted fallback chain means.
+///
+/// Only when *every* engine agreed there is nothing is an empty answer the
+/// truth. If one engine was rate-limited and another merely came back empty,
+/// reporting `count: 0` with exit 0 would hide the real failure behind a
+/// confident-looking "no results".
+fn resolve_outcome<T>(
+    empty_from: Option<&'static str>,
+    last_err: Option<Error>,
+) -> Result<(Vec<T>, &'static str)> {
     match (empty_from, last_err) {
-        // Every engine answered "nothing found" — that is a valid answer.
-        (Some(used), _) => Ok((Vec::new(), used)),
-        (None, Some(e)) => Err(e.into()),
+        (_, Some(e)) => Err(e.into()),
+        (Some(used), None) => Ok((Vec::new(), used)),
         (None, None) => Err(Error::NoResults("no engine was available".into()).into()),
     }
 }
@@ -362,7 +388,7 @@ fn search_with_cache(
         vec![engines::canonical_engine(name).unwrap_or("duckduckgo")]
     };
 
-    let (results, engine_used) = try_engines(ctx, &order, |eng_name| {
+    let (results, engine_used) = try_engines(&|m| ctx.trace(m), &order, |eng_name| {
         let eng = engine_by_name(eng_name)?;
         eng.search(ctx.client, query, opts).map(|r| (r, eng.name()))
     })?;
@@ -393,9 +419,10 @@ fn images_with_cache(
         vec![engines::canonical_image_engine(name).unwrap_or("bing")]
     };
 
-    let (results, engine_used) = try_engines(ctx, &order, |eng_name| {
+    let opts = ctx.image_opts(count, safe);
+    let (results, engine_used) = try_engines(&|m| ctx.trace(m), &order, |eng_name| {
         let eng = image_engine_by_name(eng_name)?;
-        eng.search(ctx.client, query, count, safe)
+        eng.search(ctx.client, query, &opts)
             .map(|r| (r, eng.name()))
     })?;
 
@@ -436,5 +463,129 @@ fn output_mode(cli: &Cli) -> Mode {
         Mode::Pretty
     } else {
         Mode::auto()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive `try_engines` with scripted per-engine outcomes.
+    fn run_chain(
+        order: &[&'static str],
+        script: Vec<error::Result<Vec<SearchResult>>>,
+    ) -> (Result<(Vec<SearchResult>, &'static str)>, Vec<&'static str>) {
+        let mut calls = Vec::new();
+        let mut it = script.into_iter();
+        let order_owned = order.to_vec();
+        let mut idx = 0usize;
+        let out = try_engines(&|_| {}, order, |name| {
+            calls.push(name);
+            let _ = &order_owned;
+            idx += 1;
+            it.next()
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .map(|r| (r, name))
+        });
+        (out, calls)
+    }
+
+    fn hit(url: &str) -> SearchResult {
+        SearchResult {
+            title: "t".into(),
+            url: url.into(),
+            snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_empty_first_engine_falls_through_to_the_next() {
+        // The most common real failure is a scraper whose selectors stopped
+        // matching: HTTP 200, zero results. Treating that as success meant the
+        // headline fallback feature never fired for it.
+        let (out, calls) = run_chain(
+            &["duckduckgo", "bing"],
+            vec![Ok(vec![]), Ok(vec![hit("https://b/1")])],
+        );
+        let (results, engine) = out.expect("bing should have answered");
+        assert_eq!(calls, vec!["duckduckgo", "bing"], "second engine not tried");
+        assert_eq!(engine, "bing", "the responding engine must be reported");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn an_erroring_first_engine_falls_through_to_the_next() {
+        let (out, calls) = run_chain(
+            &["duckduckgo", "bing"],
+            vec![
+                Err(Error::RateLimited("ddg".into())),
+                Ok(vec![hit("https://b/1")]),
+            ],
+        );
+        assert_eq!(out.expect("bing answers").1, "bing");
+        assert_eq!(calls, vec!["duckduckgo", "bing"]);
+    }
+
+    #[test]
+    fn the_first_useful_answer_wins_and_stops_the_chain() {
+        let (out, calls) = run_chain(
+            &["duckduckgo", "bing"],
+            vec![Ok(vec![hit("https://a/1")]), Ok(vec![hit("https://b/1")])],
+        );
+        assert_eq!(out.unwrap().1, "duckduckgo");
+        assert_eq!(
+            calls,
+            vec!["duckduckgo"],
+            "must not query engines it doesn't need"
+        );
+    }
+
+    #[test]
+    fn a_single_engine_order_never_consults_another() {
+        // This is what --no-fallback and every vertical rely on.
+        let (out, calls) = run_chain(&["pubmed"], vec![Ok(vec![])]);
+        assert_eq!(out.unwrap().1, "pubmed");
+        assert_eq!(calls, vec!["pubmed"]);
+    }
+
+    #[test]
+    fn a_non_retryable_error_stops_the_chain_immediately() {
+        // A config mistake is the user's, not the upstream's: rerouting it
+        // would hide the mistake behind someone else's results.
+        let (out, calls) = run_chain(
+            &["duckduckgo", "bing"],
+            vec![
+                Err(Error::Config("bad engine".into())),
+                Ok(vec![hit("https://b/1")]),
+            ],
+        );
+        assert!(out.is_err());
+        assert_eq!(calls, vec!["duckduckgo"]);
+    }
+
+    #[test]
+    fn a_real_failure_outranks_an_empty_answer() {
+        // duckduckgo's selectors broke (Ok, 0 results) while bing was
+        // rate-limited. Reporting "no results" here would tell the agent the
+        // web contains nothing on the subject.
+        let out = resolve_outcome::<SearchResult>(
+            Some("duckduckgo"),
+            Some(Error::RateLimited("bing".into())),
+        );
+        let err = out.expect_err("a rate limit must not be hidden behind count: 0");
+        assert!(err.to_string().contains("rate-limited"), "{err}");
+    }
+
+    #[test]
+    fn unanimous_emptiness_is_a_valid_answer() {
+        let (results, engine) =
+            resolve_outcome::<SearchResult>(Some("bing"), None).expect("exit 0");
+        assert!(results.is_empty());
+        assert_eq!(engine, "bing");
+    }
+
+    #[test]
+    fn no_engine_at_all_is_an_error() {
+        assert!(resolve_outcome::<SearchResult>(None, None).is_err());
     }
 }

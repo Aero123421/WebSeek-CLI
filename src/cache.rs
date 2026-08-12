@@ -147,9 +147,13 @@ impl Cache {
                 return;
             }
         }
-        let tmp = self
-            .path
-            .with_extension(format!("json.{}.tmp", std::process::id()));
+        // Unique per process *and* per thread: two savers sharing a temp name
+        // is exactly how a half-written file gets renamed into place.
+        let tmp = self.path.with_extension(format!(
+            "json.{}.{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let result = serde_json::to_vec(&self.entries)
             .map_err(|e| e.to_string())
             .and_then(|bytes| {
@@ -286,13 +290,164 @@ mod tests {
 
     #[test]
     fn ttl_expiry() {
+        // Timestamps have whole-second resolution, so a 1-second TTL can
+        // expire an entry written microseconds before a second boundary. Use
+        // 2s for the "still fresh" assertion and sleep past the full window.
         let dir = temp_dir("ttl");
-        let mut cache = Cache::load(dir.join("cache.json"), 1, 10);
+        let mut cache = Cache::load(dir.join("cache.json"), 2, 10);
         let key = cache_key(&["x"]);
         cache.put(key.clone(), serde_json::json!("v"));
         assert_eq!(cache.get(&key), Some(serde_json::json!("v")));
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::thread::sleep(std::time::Duration::from_millis(2600));
         assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn the_real_key_builders_are_sensitive_to_every_option() {
+        // `keys_differ_by_options` only proved SHA-256 is injective — it never
+        // called these. Dropping an option here is a live correctness bug:
+        // `fetch URL` then `fetch URL --html` would serve the extracted text.
+        let base = crate::models::FetchOpts::default();
+        let baseline = fetch_key("https://x", &base);
+        for (label, opts) in [
+            (
+                "max_chars",
+                crate::models::FetchOpts {
+                    max_chars: 10,
+                    ..base.clone()
+                },
+            ),
+            (
+                "raw_html",
+                crate::models::FetchOpts {
+                    raw_html: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "markdown",
+                crate::models::FetchOpts {
+                    markdown: true,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert_ne!(
+                baseline,
+                fetch_key("https://x", &opts),
+                "fetch_key ignores {label}"
+            );
+        }
+        assert_ne!(
+            baseline,
+            fetch_key("https://y", &base),
+            "fetch_key ignores the URL"
+        );
+
+        let s = crate::models::SearchOpts::default();
+        let sbase = search_key("bing", "q", &s);
+        for (label, opts) in [
+            (
+                "count",
+                crate::models::SearchOpts {
+                    count: 9,
+                    ..s.clone()
+                },
+            ),
+            (
+                "lang",
+                crate::models::SearchOpts {
+                    lang: Some("ja".into()),
+                    ..s.clone()
+                },
+            ),
+            (
+                "region",
+                crate::models::SearchOpts {
+                    region: Some("jp".into()),
+                    ..s.clone()
+                },
+            ),
+            (
+                "safe",
+                crate::models::SearchOpts {
+                    safe: true,
+                    ..s.clone()
+                },
+            ),
+        ] {
+            assert_ne!(
+                sbase,
+                search_key("bing", "q", &opts),
+                "search_key ignores {label}"
+            );
+        }
+        assert_ne!(
+            sbase,
+            search_key("duckduckgo", "q", &s),
+            "search_key ignores the engine"
+        );
+        assert_ne!(
+            sbase,
+            search_key("bing", "other", &s),
+            "search_key ignores the query"
+        );
+
+        let ibase = images_key("bing", "q", 5, false);
+        assert_ne!(
+            ibase,
+            images_key("bing", "q", 6, false),
+            "images_key ignores count"
+        );
+        assert_ne!(
+            ibase,
+            images_key("bing", "q", 5, true),
+            "images_key ignores safe"
+        );
+        assert_ne!(
+            ibase,
+            images_key("ddg", "q", 5, false),
+            "images_key ignores the engine"
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_never_leave_a_torn_file() {
+        // The documented reason for tmp+rename. A direct write to the final
+        // path lets one saver read another's half-written JSON.
+        let dir = temp_dir("torn");
+        let path = dir.join("cache.json");
+        let big: String = "x".repeat(40_000);
+
+        std::thread::scope(|s| {
+            for n in 0..8 {
+                let path = path.clone();
+                let big = big.clone();
+                s.spawn(move || {
+                    let mut c = Cache::load(path, 3600, 100);
+                    for i in 0..20 {
+                        c.put(
+                            cache_key(&[&n.to_string(), &i.to_string()]),
+                            serde_json::json!(big),
+                        );
+                    }
+                    c.save();
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(&path).expect("a cache file exists");
+        serde_json::from_str::<HashMap<String, CachedValue>>(&raw)
+            .expect("the surviving file must be complete JSON, not a torn write");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
