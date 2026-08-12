@@ -1,0 +1,42 @@
+name: Broken engine / parser
+description: An engine returns no results, or results that look wrong.
+labels: ["bug", "engine"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Scraped engines (DuckDuckGo, Bing, image search) break when the
+        upstream markup changes. Stable sources break far less often, so please
+        say which kind you hit.
+  - type: input
+    id: engine
+    attributes:
+      label: Engine
+      placeholder: duckduckgo
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom
+      options:
+        - Zero results for a query that should match
+        - Results present but fields are wrong (URL, title, snippet)
+        - Reported as rate-limited when it should not be
+        - Something else
+    validations:
+      required: true
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Checks
+      options:
+        - label: Reproduces with `--no-cache`
+        - label: Reproduces with `--no-fallback` (so it is really this engine)

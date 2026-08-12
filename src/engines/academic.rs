@@ -13,14 +13,13 @@ use url::Url;
 use crate::engines::SearchEngine;
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
+use crate::text::{join_meta, normalize_snippet, strip_html};
 
 // ---------------------------------------------------------------------------
 // OpenAlex
 // ---------------------------------------------------------------------------
 
 const OPENALEX_URL: &str = "https://api.openalex.org/works";
-/// Contact hint for OpenAlex's "polite pool" (their recommendation).
-const OPENALEX_MAILTO: &str = "webseek@example.org";
 
 pub struct OpenAlex {
     base: String,
@@ -80,28 +79,31 @@ impl SearchEngine for OpenAlex {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let params: Vec<(&str, &str)> = vec![
-            ("search", query),
-            ("per-page", &limit),
-            ("mailto", OPENALEX_MAILTO),
-        ];
+        let mut params: Vec<(&str, &str)> = vec![("search", query), ("per-page", &limit)];
+        // OpenAlex's "polite pool" exists so they can contact whoever is
+        // calling. A placeholder address would claim that benefit while making
+        // the promise unkeepable, so we only send a real, user-configured one.
+        if let Some(mail) = opts.contact_email.as_deref() {
+            params.push(("mailto", mail));
+        }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("openalex request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(openalex_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        openalex_parse(&body)
     }
 }
 
-pub fn openalex_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<OaResp>(body) else {
-        return Vec::new();
-    };
-    resp.results
+pub fn openalex_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<OaResp>(body)
+        .map_err(|e| Error::Parse(format!("openalex response is not valid JSON: {e}")))?;
+    Ok(resp
+        .results
         .into_iter()
         .filter_map(|w| {
             let title = w.display_name.or(w.title)?;
@@ -111,26 +113,21 @@ pub fn openalex_parse(body: &str) -> Vec<SearchResult> {
                 .and_then(|l| l.source)
                 .and_then(|s| s.display_name)
                 .unwrap_or_default();
-            let mut snippet = String::new();
-            if let Some(y) = w.publication_year {
-                snippet.push_str(&format!("{y}"));
-            }
-            if !venue.is_empty() {
-                if !snippet.is_empty() {
-                    snippet.push_str(" · ");
-                }
-                snippet.push_str(&venue);
-            }
-            if let Some(c) = w.cited_by_count {
-                snippet.push_str(&format!(" · cited {c}"));
-            }
+            let year = w
+                .publication_year
+                .map(|y| y.to_string())
+                .unwrap_or_default();
+            let cited = w
+                .cited_by_count
+                .map(|c| format!("cited {c}"))
+                .unwrap_or_default();
             Some(SearchResult {
-                title,
+                title: normalize_snippet(&strip_html(&title)),
                 url,
-                snippet,
+                snippet: normalize_snippet(&join_meta(&[&year, &venue, &cited])),
             })
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +191,7 @@ impl SearchEngine for CrossRef {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let params: Vec<(&str, &str)> = vec![
+        let mut params: Vec<(&str, &str)> = vec![
             ("query", query),
             ("rows", &limit),
             (
@@ -202,26 +199,31 @@ impl SearchEngine for CrossRef {
                 "DOI,title,URL,container-title,published,is-referenced-by-count",
             ),
         ];
+        // CrossRef has the same polite-pool convention as OpenAlex.
+        if let Some(mail) = opts.contact_email.as_deref() {
+            params.push(("mailto", mail));
+        }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("crossref request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(crossref_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        crossref_parse(&body)
     }
 }
 
-pub fn crossref_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<CrResp>(body) else {
-        return Vec::new();
-    };
-    let Some(msg) = resp.message else {
-        return Vec::new();
-    };
-    msg.items
+pub fn crossref_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<CrResp>(body)
+        .map_err(|e| Error::Parse(format!("crossref response is not valid JSON: {e}")))?;
+    let msg = resp
+        .message
+        .ok_or_else(|| Error::Parse("crossref response omitted message.items".into()))?;
+    Ok(msg
+        .items
         .into_iter()
         .filter_map(|w| {
             let title = w.title.first()?.clone();
@@ -237,21 +239,19 @@ pub fn crossref_parse(body: &str) -> Vec<SearchResult> {
                 .and_then(|d| d.first())
                 .copied()
                 .unwrap_or(0);
-            let mut snippet = String::new();
-            if !container.is_empty() {
-                snippet.push_str(&container);
-            }
-            if year > 0 {
-                snippet.push_str(&format!(" · {year}"));
-            }
-            snippet.push_str(&format!(" · cited {}", w.citations));
+            let year = if year > 0 {
+                year.to_string()
+            } else {
+                String::new()
+            };
+            let cited = format!("cited {}", w.citations);
             Some(SearchResult {
-                title,
+                title: normalize_snippet(&strip_html(&title)),
                 url,
-                snippet,
+                snippet: normalize_snippet(&join_meta(&[&container, &year, &cited])),
             })
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -306,57 +306,79 @@ impl SearchEngine for PubMed {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let ids = self.fetch_ids(client, query, &limit)?;
+        let ids = self.fetch_ids(client, query, &limit, opts)?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let joined = ids.join(",");
-        let params: Vec<(&str, &str)> =
+        let mut params: Vec<(&str, &str)> =
             vec![("db", "pubmed"), ("id", &joined), ("retmode", "json")];
+        eutils_identity(&mut params, opts);
         let url = Url::parse_with_params(&self.esummary_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esummary failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(pubmed_parse(&body, &ids))
+        let body = crate::http::response_text(resp)?;
+        pubmed_parse(&body, &ids)
+    }
+}
+
+/// NCBI's E-utilities usage policy asks every client to identify itself with a
+/// `tool` name and, where possible, an `email`. Both are cheap to send and are
+/// the difference between being a known caller and an anonymous one.
+fn eutils_identity<'a>(params: &mut Vec<(&'a str, &'a str)>, opts: &'a SearchOpts) {
+    params.push(("tool", "webseek"));
+    if let Some(mail) = opts.contact_email.as_deref() {
+        params.push(("email", mail));
     }
 }
 
 impl PubMed {
-    fn fetch_ids(&self, client: &Client, query: &str, limit: &str) -> Result<Vec<String>> {
-        let params: Vec<(&str, &str)> = vec![
+    fn fetch_ids(
+        &self,
+        client: &Client,
+        query: &str,
+        limit: &str,
+        opts: &SearchOpts,
+    ) -> Result<Vec<String>> {
+        let mut params: Vec<(&str, &str)> = vec![
             ("db", "pubmed"),
             ("term", query),
             ("retmode", "json"),
             ("retmax", limit),
         ];
+        eutils_identity(&mut params, opts);
         let url = Url::parse_with_params(&self.esearch_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esearch failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        let Ok(parsed) = serde_json::from_str::<ESearchResp>(&body) else {
-            return Ok(Vec::new());
-        };
-        Ok(parsed.esearchresult.map(|r| r.idlist).unwrap_or_default())
+        let body = crate::http::response_text(resp)?;
+        let parsed = serde_json::from_str::<ESearchResp>(&body)
+            .map_err(|e| Error::Parse(format!("pubmed esearch response is not valid JSON: {e}")))?;
+        parsed
+            .esearchresult
+            .map(|r| r.idlist)
+            .ok_or_else(|| Error::Parse("pubmed esearch response omitted esearchresult".into()))
     }
 }
 
 /// Build results from an esummary body, preserving esearch's `ids` order.
-pub fn pubmed_parse(body: &str, ids: &[String]) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<ESumResp>(body) else {
-        return Vec::new();
-    };
-    let Some(result) = resp.result else {
-        return Vec::new();
-    };
-    ids.iter()
+pub fn pubmed_parse(body: &str, ids: &[String]) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<ESumResp>(body)
+        .map_err(|e| Error::Parse(format!("pubmed esummary response is not valid JSON: {e}")))?;
+    let result = resp
+        .result
+        .ok_or_else(|| Error::Parse("pubmed esummary response omitted result".into()))?;
+    Ok(ids
+        .iter()
         .filter_map(|uid| {
             let doc = result.get(uid)?;
             let title = doc.get("title")?.as_str()?.to_string();
@@ -368,23 +390,13 @@ pub fn pubmed_parse(body: &str, ids: &[String]) -> Vec<SearchResult> {
                 .get("pubdate")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let mut snippet = String::new();
-            if !source.is_empty() {
-                snippet.push_str(source);
-            }
-            if !pubdate.is_empty() {
-                if !snippet.is_empty() {
-                    snippet.push_str(" · ");
-                }
-                snippet.push_str(pubdate);
-            }
             Some(SearchResult {
-                title,
+                title: normalize_snippet(&strip_html(&title)),
                 url: format!("https://pubmed.ncbi.nlm.nih.gov/{uid}/"),
-                snippet,
+                snippet: normalize_snippet(&join_meta(&[source, pubdate])),
             })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -397,7 +409,7 @@ mod tests {
           {"id":"https://openalex.org/W1","doi":"https://doi.org/10.1/x","display_name":"On Async","publication_year":2021,"cited_by_count":7,"primary_location":{"source":{"display_name":"J. Systems"}}},
           {"id":"https://openalex.org/W2","title":"No Doi Here"}
         ]}"#;
-        let r = openalex_parse(body);
+        let r = openalex_parse(body).unwrap();
         // Second work has no doi/id-as-url? it has id -> url ok.
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "On Async");
@@ -411,7 +423,7 @@ mod tests {
         let body = r#"{"message":{"items":[
           {"DOI":"10.1/x","title":["ASYNC 2020"],"URL":"https://doi.org/10.1/x","container-title":["IEEE ASYNC"],"published":{"date-parts":[[2020,5]]},"is-referenced-by-count":3}
         ]}}"#;
-        let r = crossref_parse(body);
+        let r = crossref_parse(body).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].title, "ASYNC 2020");
         assert_eq!(r[0].snippet, "IEEE ASYNC · 2020 · cited 3");
@@ -424,7 +436,7 @@ mod tests {
           "2":{"uid":"2","title":"Second paper","source":"Cell","pubdate":"2021 Feb"}
         }}"#;
         // Order follows the ids we pass (esearch order), not the JSON order.
-        let r = pubmed_parse(body, &["1".to_string(), "2".to_string()]);
+        let r = pubmed_parse(body, &["1".to_string(), "2".to_string()]).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "First paper");
         assert_eq!(r[0].url, "https://pubmed.ncbi.nlm.nih.gov/1/");
@@ -433,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(openalex_parse("x").is_empty());
-        assert!(crossref_parse("x").is_empty());
-        assert!(pubmed_parse("x", &["1".into()]).is_empty());
+    fn bad_json_is_an_error() {
+        assert!(openalex_parse("x").is_err());
+        assert!(crossref_parse("x").is_err());
+        assert!(pubmed_parse("x", &["1".into()]).is_err());
     }
 }

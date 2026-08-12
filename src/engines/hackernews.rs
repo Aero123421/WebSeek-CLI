@@ -10,6 +10,7 @@ use url::Url;
 use crate::engines::SearchEngine;
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
+use crate::text::{join_meta, normalize_snippet};
 
 const SEARCH_URL: &str = "https://hn.algolia.com/api/v1/search";
 
@@ -63,22 +64,23 @@ impl SearchEngine for HackerNews {
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
-        let resp = crate::http::send_with_retry(&client.get(url))
+        let resp = opts
+            .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("hackernews request failed: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body))
+        let body = crate::http::response_text(resp)?;
+        parse_results(&body)
     }
 }
 
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<Resp>(body) else {
-        return Vec::new();
-    };
-    resp.hits
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<Resp>(body)
+        .map_err(|e| Error::Parse(format!("hackernews response is not valid JSON: {e}")))?;
+    Ok(resp
+        .hits
         .into_iter()
         .filter_map(|h| {
             let title = h.title.filter(|t| !t.is_empty())?;
@@ -86,19 +88,18 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 .url
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| format!("https://news.ycombinator.com/item?id={}", h.object_id));
-            let snippet = format!(
-                "{} points · {} comments · by {}",
-                h.points.unwrap_or(0),
-                h.num_comments.unwrap_or(0),
-                h.author.as_deref().unwrap_or("?")
-            );
+            let snippet = join_meta(&[
+                &format!("{} points", h.points.unwrap_or(0)),
+                &format!("{} comments", h.num_comments.unwrap_or(0)),
+                &format!("by {}", h.author.as_deref().unwrap_or("?")),
+            ]);
             Some(SearchResult {
-                title,
+                title: normalize_snippet(&title),
                 url,
-                snippet,
+                snippet: normalize_snippet(&snippet),
             })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -112,7 +113,7 @@ mod tests {
 
     #[test]
     fn parses_hn_hits_and_falls_back_to_item_url() {
-        let r = parse_results(FIXTURE);
+        let r = parse_results(FIXTURE).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "Tokio 1.0");
         assert_eq!(r[0].url, "https://tokio.rs/blog");
@@ -123,7 +124,9 @@ mod tests {
 
     #[test]
     fn skips_titleless_hits_and_bad_json() {
-        assert!(parse_results(r#"{"hits":[{"objectID":"9","title":null}]}"#).is_empty());
-        assert!(parse_results("nope").is_empty());
+        assert!(parse_results(r#"{"hits":[{"objectID":"9","title":null}]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_results("nope").is_err());
     }
 }

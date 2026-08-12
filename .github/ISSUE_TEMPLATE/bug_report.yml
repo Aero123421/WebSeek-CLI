@@ -1,0 +1,47 @@
+name: Bug report
+description: Something webseek does is wrong or broken.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If this is a **security** issue, please use
+        private reporting instead — see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: webseek version
+      description: Output of `webseek --version`.
+      placeholder: webseek 0.3.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, macOS (Apple Silicon), macOS (Intel), Windows, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact invocation, including flags.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+      description: |
+        Paste stdout/stderr. Re-running with `--verbose` usually says which
+        engine answered and whether the cache was hit.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: config.toml (optional)
+      description: Redact anything private, such as contact_email.
+      render: toml

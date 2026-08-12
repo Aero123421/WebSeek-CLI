@@ -1,8 +1,13 @@
 [package]
 name = "webseek"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.75"
+# Verified in CI by building the binary with exactly this toolchain. The
+# previously declared 1.75 was never checked and had not been true for some
+# time (the `url` -> `idna_adapter` -> `icu_*` chain alone needs 1.86).
+# Running the *test suite* needs a newer toolchain than this, because the
+# `wiremock` dev-dependency uses let-chains; that does not affect users.
+rust-version = "1.86"
 description = "API-key-free web search & page fetch CLI designed for AI agents"
 license = "MIT"
 keywords = ["search", "cli", "web", "agent", "scrape"]
@@ -13,10 +18,14 @@ readme = "README.md"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 directories = "5"
 ego-tree = "0.6"
+encoding_rs = "0.8"
+fs2 = "0.4"
 open = "5"
 percent-encoding = "2"
+quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "gzip",
@@ -27,10 +36,17 @@ scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
+# Used by reqwest's guarded DNS resolver to move blocking name resolution off
+# its async runtime thread. reqwest already depends on Tokio; this enables the
+# one runtime API the resolver needs.
+tokio = { version = "1", features = ["rt"] }
 toml = "0.8"
 url = "2"
 
 [dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 wiremock = "0.6"
 

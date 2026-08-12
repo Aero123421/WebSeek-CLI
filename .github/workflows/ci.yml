@@ -4,20 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # A dependency advisory can land without anyone touching this repo, so the
+    # audit needs a clock of its own rather than riding on pushes.
+    - cron: "23 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,14 +41,47 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # --locked everywhere: CI must build the dependency set that is
+      # committed, otherwise the lockfile is decorative.
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       - name: Release build
-        run: cargo build --release
+        run: cargo build --locked --release
+
+  msrv:
+    name: minimum supported Rust version
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      # Only the library and binary: the declared MSRV is a promise to people
+      # who *build webseek*, and dev-dependencies are not part of that.
+      - name: Build with the declared MSRV
+        run: cargo build --locked --release
 
   audit:
     name: security audit
@@ -43,8 +89,11 @@ jobs:
     permissions:
       contents: read
       checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: rustsec/audit-check@v2.0.0
         with:

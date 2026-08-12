@@ -1,20 +1,16 @@
-//! Region / locale normalization.
+//! BCP-47-shaped locale parsing for `--region`.
 //!
-//! `--region` accepts flexible human input (`jp`, `JP`, `jp-jp`, `en-us`,
-//! `en_US`) and each engine receives the exact format it expects:
+//! `--region` accepts a language tag in standard BCP-47 subtag order —
+//! `language[-script][-region]`, such as `en-US` or `zh-Hant-TW` — plus a
+//! lone country code such as `jp` or `US`.
 //!
-//! - **DuckDuckGo** `kl` parameter: `<country>-<language>` (e.g. `us-en`,
-//!   `jp-jp`). Unknown regions are omitted rather than sent malformed.
-//! - **Bing** `cc` parameter: a 2-letter country code (e.g. `us`); the
-//!   language (if any) feeds `setlang`.
-//!
-//! Disambiguation between `ll-CC` and `CC-ll` uses a small built-in table of
-//! common ISO 3166-1 alpha-2 country codes. Codes outside the table fall back
-//! to a positional heuristic (first segment = country), which is documented as
-//! a best-effort limitation.
+//! Multiple subtags are never direction-guessed: the first is the language,
+//! followed by an optional script and country. This matters for inputs such as
+//! `fr-CA` and `de-CH`, where both segments can look like country codes.
 
-/// Common ISO 3166-1 alpha-2 country codes. Not exhaustive by design; see
-/// module docs for the fallback behavior.
+/// Common ISO 3166-1 alpha-2 country codes, used only to distinguish a lone
+/// country (`jp`) from a lone language (`en`). Multi-part tags are parsed by
+/// BCP-47 shape instead.
 const COUNTRIES: &[&str] = &[
     "us", "gb", "uk", "ca", "au", "nz", "ie", "jp", "cn", "hk", "tw", "kr", "in", "sg", "my", "th",
     "vn", "id", "ph", "de", "fr", "es", "it", "pt", "nl", "be", "ch", "at", "se", "no", "fi", "dk",
@@ -25,68 +21,154 @@ fn is_country(seg: &str) -> bool {
     COUNTRIES.contains(&seg)
 }
 
-/// A parsed locale: an optional country and an optional language, both
-/// lower-cased 2-letter codes.
+/// A parsed locale. `country` is retained for API compatibility even though
+/// BCP-47 calls the same component a region subtag.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Locale {
     pub country: Option<String>,
     pub language: Option<String>,
+    pub script: Option<String>,
 }
 
-/// Parse a flexible region string into a [`Locale`].
-///
-/// Accepts `CC`, `cc-cc`, `ll-CC`, `CC-ll`, and `_` as a separator.
-pub fn parse_region(region: &str) -> Locale {
-    let cleaned: String = region
+fn normalize(region: &str) -> String {
+    region
         .trim()
         .to_ascii_lowercase()
         .chars()
         .map(|c| if c == '_' { '-' } else { c })
-        .collect();
+        .collect()
+}
+
+fn is_language_subtag(value: &str) -> bool {
+    (2..=3).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn is_script_subtag(value: &str) -> bool {
+    value.len() == 4 && value.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn is_country_subtag(value: &str) -> bool {
+    (value.len() == 2 && value.bytes().all(|b| b.is_ascii_alphabetic()))
+        || (value.len() == 3 && value.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Parse a flexible region string into a [`Locale`].
+///
+/// Accepts a lone country or language, and BCP-47-shaped
+/// `language[-script][-country]` input. `_` is accepted as a separator.
+pub fn parse_region(region: &str) -> Locale {
+    let cleaned = normalize(region);
     let parts: Vec<&str> = cleaned.split('-').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [] => Locale::default(),
         [only] => {
-            let seg = only.to_string();
-            if is_country(&seg) {
+            if is_country(only) {
                 Locale {
-                    country: Some(seg),
-                    language: None,
+                    country: Some((*only).to_string()),
+                    ..Default::default()
                 }
-            } else {
-                // A lone non-country token is treated as a language.
+            } else if is_language_subtag(only) {
                 Locale {
                     country: None,
-                    language: Some(seg),
-                }
-            }
-        }
-        [a, b, ..] => {
-            if is_country(a) {
-                // `CC-ll` (or `CC-CC` like `jp-jp`).
-                let language = if *a == *b || !is_country(b) {
-                    Some(b.to_string())
-                } else {
-                    None
-                };
-                Locale {
-                    country: Some(a.to_string()),
-                    language,
-                }
-            } else if is_country(b) {
-                // `ll-CC`.
-                Locale {
-                    country: Some(b.to_string()),
-                    language: Some(a.to_string()),
+                    language: Some((*only).to_string()),
+                    script: None,
                 }
             } else {
-                // Unknown codes: positional fallback (first = country).
-                Locale {
-                    country: Some(a.to_string()),
-                    language: Some(b.to_string()),
-                }
+                Locale::default()
             }
         }
+        [language, rest @ ..] if is_language_subtag(language) => {
+            let mut locale = Locale {
+                language: Some((*language).to_string()),
+                ..Default::default()
+            };
+            let mut index = 0;
+            if let Some(script) = rest.first().filter(|s| is_script_subtag(s)) {
+                locale.script = Some(title_case(script));
+                index = 1;
+            }
+            if let Some(country) = rest.get(index).filter(|s| is_country_subtag(s)) {
+                locale.country = Some((*country).to_string());
+            }
+            locale
+        }
+        rest => {
+            // Malformed leading subtags do not become engine parameters, but
+            // retain a later structurally valid country when one exists.
+            Locale {
+                country: rest
+                    .iter()
+                    .copied()
+                    .find(|part| is_country_subtag(part))
+                    .map(str::to_string),
+                language: None,
+                script: None,
+            }
+        }
+    }
+}
+
+/// DuckDuckGo's locale parameter uses several legacy language codes rather
+/// than blindly repeating the country code. Unknown country-only input is
+/// omitted instead of fabricating a likely-invalid value.
+fn ddg_default_language(country: &str) -> Option<&'static str> {
+    match country {
+        "us" | "gb" | "uk" | "ca" | "au" | "nz" | "ie" | "in" | "sg" | "za" | "ph" => Some("en"),
+        "jp" => Some("jp"),
+        "cn" => Some("zh"),
+        "hk" | "tw" => Some("tzh"),
+        "kr" => Some("kr"),
+        "br" => Some("pt"),
+        "mx" | "ar" | "cl" | "co" => Some("es"),
+        "de" | "at" | "ch" => Some("de"),
+        "fr" | "be" => Some("fr"),
+        "es" => Some("es"),
+        "it" => Some("it"),
+        "pt" => Some("pt"),
+        "nl" => Some("nl"),
+        "se" => Some("sv"),
+        "no" => Some("no"),
+        "fi" => Some("fi"),
+        "dk" => Some("da"),
+        "pl" => Some("pl"),
+        "cz" => Some("cs"),
+        "gr" => Some("el"),
+        "tr" => Some("tr"),
+        "ru" => Some("ru"),
+        "ua" => Some("uk"),
+        "th" => Some("th"),
+        "vn" => Some("vi"),
+        "id" => Some("id"),
+        "my" => Some("ms"),
+        "il" => Some("he"),
+        "sa" | "ae" | "eg" => Some("ar"),
+        _ => None,
+    }
+}
+
+fn ddg_country(country: &str) -> &str {
+    if country == "gb" {
+        "uk"
+    } else {
+        country
+    }
+}
+
+fn ddg_language(language: &str, script: Option<&str>, country: &str) -> String {
+    match language {
+        // DuckDuckGo's `kl` values predate BCP-47 and retain these labels.
+        "ja" => "jp".to_string(),
+        "ko" => "kr".to_string(),
+        "zh" if matches!(country, "hk" | "tw") || script == Some("Hant") => "tzh".to_string(),
+        _ => language.to_string(),
     }
 }
 
@@ -94,9 +176,14 @@ pub fn parse_region(region: &str) -> Locale {
 /// country is present (so the parameter is simply omitted).
 pub fn ddg_kl(region: &str) -> Option<String> {
     let loc = parse_region(region);
+    let script = loc.script.as_deref();
     match (loc.country, loc.language) {
-        (Some(c), Some(l)) => Some(format!("{c}-{l}")),
-        (Some(c), None) => Some(format!("{c}-{c}")),
+        (Some(country), Some(language)) => {
+            let language = ddg_language(&language, script, &country);
+            Some(format!("{}-{language}", ddg_country(&country)))
+        }
+        (Some(country), None) => ddg_default_language(&country)
+            .map(|language| format!("{}-{language}", ddg_country(&country))),
         (None, _) => None,
     }
 }
@@ -115,10 +202,20 @@ pub fn bing_language(region: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn locale(language: Option<&str>, script: Option<&str>, country: Option<&str>) -> Locale {
+        Locale {
+            country: country.map(str::to_string),
+            language: language.map(str::to_string),
+            script: script.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn country_only_duplicates_for_ddg() {
+    fn country_only_uses_duckduckgo_locale_codes() {
         assert_eq!(ddg_kl("jp"), Some("jp-jp".into()));
-        assert_eq!(ddg_kl("US"), Some("us-us".into()));
+        assert_eq!(ddg_kl("US"), Some("us-en".into()));
+        assert_eq!(ddg_kl("br"), Some("br-pt".into()));
+        assert_eq!(ddg_kl("GB"), Some("uk-en".into()));
         assert_eq!(bing_cc("jp"), Some("jp".into()));
     }
 
@@ -131,9 +228,27 @@ mod tests {
     }
 
     #[test]
-    fn country_language_is_kept_for_ddg() {
-        assert_eq!(ddg_kl("us-en"), Some("us-en".into()));
+    fn multiple_subtags_follow_bcp47_order() {
+        assert_eq!(ddg_kl("fr-CA"), Some("ca-fr".into()));
+        assert_eq!(ddg_kl("de-CH"), Some("ch-de".into()));
+        assert_eq!(ddg_kl("pt-BR"), Some("br-pt".into()));
+        assert_eq!(ddg_kl("us-en"), Some("en-us".into()));
         assert_eq!(ddg_kl("jp-jp"), Some("jp-jp".into()));
+        assert_eq!(ddg_kl("ja-JP"), Some("jp-jp".into()));
+        assert_eq!(ddg_kl("ko-KR"), Some("kr-kr".into()));
+        assert_eq!(ddg_kl("zh-Hant-TW"), Some("tw-tzh".into()));
+    }
+
+    #[test]
+    fn script_subtag_does_not_consume_country() {
+        assert_eq!(
+            parse_region("zh-Hant-TW"),
+            locale(Some("zh"), Some("Hant"), Some("tw"))
+        );
+        assert_eq!(
+            parse_region("sr-Latn-RS"),
+            locale(Some("sr"), Some("Latn"), Some("rs"))
+        );
     }
 
     #[test]
@@ -153,12 +268,20 @@ mod tests {
     fn empty_and_blank_yield_nothing() {
         assert_eq!(ddg_kl(""), None);
         assert_eq!(bing_cc("   "), None);
+        assert_eq!(parse_region("-"), Locale::default());
     }
 
     #[test]
-    fn unknown_codes_use_positional_fallback() {
-        // Neither segment is a known country -> first treated as country.
-        assert_eq!(ddg_kl("xx-yy"), Some("xx-yy".into()));
-        assert_eq!(bing_cc("xx-yy"), Some("xx".into()));
+    fn malformed_or_unknown_country_only_input_is_not_fabricated() {
+        assert_eq!(ddg_kl("not-a-locale"), None);
+        assert_eq!(ddg_kl("xyz"), None);
+    }
+
+    #[test]
+    fn numeric_region_is_supported() {
+        assert_eq!(
+            parse_region("es-419"),
+            locale(Some("es"), None, Some("419"))
+        );
     }
 }
