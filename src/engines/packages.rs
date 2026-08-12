@@ -75,16 +75,16 @@ impl SearchEngine for Crates {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(crates_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        crates_parse(&body)
     }
 }
 
-pub fn crates_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<CratesResp>(body) else {
-        return Vec::new();
-    };
-    resp.crates
+pub fn crates_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<CratesResp>(body)
+        .map_err(|e| Error::Parse(format!("crates.io response is not valid JSON: {e}")))?;
+    Ok(resp
+        .crates
         .into_iter()
         .map(|c| {
             let url = c
@@ -103,7 +103,7 @@ pub fn crates_parse(body: &str) -> Vec<SearchResult> {
                 url,
             }
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -179,16 +179,16 @@ impl SearchEngine for Npm {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(npm_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        npm_parse(&body)
     }
 }
 
-pub fn npm_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<NpmResp>(body) else {
-        return Vec::new();
-    };
-    resp.objects
+pub fn npm_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<NpmResp>(body)
+        .map_err(|e| Error::Parse(format!("npm response is not valid JSON: {e}")))?;
+    Ok(resp
+        .objects
         .into_iter()
         .map(|o| {
             let url = o
@@ -212,7 +212,7 @@ pub fn npm_parse(body: &str) -> Vec<SearchResult> {
                 url,
             }
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -283,18 +283,17 @@ impl SearchEngine for PyPi {
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(pypi_parse(&body, name))
+        let body = crate::http::response_text(resp)?;
+        pypi_parse(&body, name)
     }
 }
 
-pub fn pypi_parse(body: &str, name: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<PyPiResp>(body) else {
-        return Vec::new();
-    };
-    let Some(info) = resp.info else {
-        return Vec::new();
-    };
+pub fn pypi_parse(body: &str, name: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<PyPiResp>(body)
+        .map_err(|e| Error::Parse(format!("pypi response is not valid JSON: {e}")))?;
+    let info = resp
+        .info
+        .ok_or_else(|| Error::Parse("pypi response omitted info".into()))?;
     let url = info
         .package_url
         .filter(|s| !s.is_empty())
@@ -307,11 +306,11 @@ pub fn pypi_parse(body: &str, name: &str) -> Vec<SearchResult> {
     };
     let summary = info.summary.unwrap_or_default();
     let version = info.version.map(|v| format!("v{v}")).unwrap_or_default();
-    vec![SearchResult {
+    Ok(vec![SearchResult {
         title,
         url,
         snippet: normalize_snippet(&join_meta(&[&summary, &version])),
-    }]
+    }])
 }
 
 #[cfg(test)]
@@ -324,7 +323,7 @@ mod tests {
           {"id":"tokio","description":"Async runtime","downloads":100,"repository":"https://github.com/tokio-rs/tokio","max_version":"1.0.0"},
           {"id":"nolib","description":null,"downloads":5,"repository":null,"documentation":null,"max_version":"0.1.0"}
         ]}"#;
-        let r = crates_parse(body);
+        let r = crates_parse(body).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "tokio");
         assert_eq!(r[0].url, "https://github.com/tokio-rs/tokio");
@@ -337,7 +336,7 @@ mod tests {
         let body = r#"{"objects":[
           {"package":{"name":"async","version":"3.2.6","description":"Async utils","links":{"npm":"https://www.npmjs.com/package/async"}},"downloads":{"monthly":1000}}
         ]}"#;
-        let r = npm_parse(body);
+        let r = npm_parse(body).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].title, "async");
         assert_eq!(r[0].url, "https://www.npmjs.com/package/async");
@@ -347,7 +346,7 @@ mod tests {
     #[test]
     fn pypi_is_single_result_lookup() {
         let body = r#"{"info":{"name":"requests","summary":"HTTP for humans","version":"2.31.0","package_url":"https://pypi.org/project/requests/"}}"#;
-        let r = pypi_parse(body, "requests");
+        let r = pypi_parse(body, "requests").unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].title, "requests");
         assert_eq!(r[0].url, "https://pypi.org/project/requests/");
@@ -355,9 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(crates_parse("x").is_empty());
-        assert!(npm_parse("x").is_empty());
-        assert!(pypi_parse("x", "y").is_empty());
+    fn bad_json_is_an_error() {
+        assert!(crates_parse("x").is_err());
+        assert!(npm_parse("x").is_err());
+        assert!(pypi_parse("x", "y").is_err());
     }
 }

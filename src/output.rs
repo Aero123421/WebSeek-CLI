@@ -19,9 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::batch::BatchItem;
+use crate::cache::CacheInfo;
 use crate::cli::ColorChoice;
 use crate::engines::EngineInfo;
 use crate::models::{FetchResult, ImageResult, SearchResult};
+use crate::text::{sanitize_line, sanitize_text};
 
 /// Set once at startup; suppresses notes and warnings on stderr.
 static QUIET: AtomicBool = AtomicBool::new(false);
@@ -143,14 +145,21 @@ pub fn write_search_to(
         }
         Mode::Pretty => {
             if results.is_empty() {
-                writeln!(w, "No results for \"{query}\" (engine: {engine}).")?;
+                writeln!(
+                    w,
+                    "No results for \"{}\" (engine: {}).",
+                    sanitize_line(query),
+                    sanitize_line(engine)
+                )?;
                 return Ok(());
             }
             for (i, r) in results.iter().enumerate() {
-                writeln!(w, "{}", paint(&format!("{:>2}. {}", i + 1, r.title), "1"))?;
-                writeln!(w, "     {}", paint(&r.url, "36"))?;
+                let title = sanitize_line(&r.title);
+                let url = sanitize_line(&r.url);
+                writeln!(w, "{}", paint(&format!("{:>2}. {title}", i + 1), "1"))?;
+                writeln!(w, "     {}", paint(&url, "36"))?;
                 if !r.snippet.is_empty() {
-                    writeln!(w, "     {}", r.snippet)?;
+                    writeln!(w, "     {}", sanitize_line(&r.snippet))?;
                 }
             }
         }
@@ -204,14 +213,17 @@ pub fn write_images_to(
         }
         Mode::Pretty => {
             for (i, r) in results.iter().enumerate() {
-                writeln!(w, "{}", paint(&format!("{:>2}. {}", i + 1, r.title), "1"))?;
-                writeln!(w, "     {}", paint(&r.url, "36"))?;
+                let title = sanitize_line(&r.title);
+                let url = sanitize_line(&r.url);
+                let page_url = sanitize_line(&r.page_url);
+                writeln!(w, "{}", paint(&format!("{:>2}. {title}", i + 1), "1"))?;
+                writeln!(w, "     {}", paint(&url, "36"))?;
                 let dims = match (r.width, r.height) {
                     (Some(w_), Some(h)) => format!("{w_}x{h}"),
                     _ => "?".into(),
                 };
                 let fmt = if r.format.is_empty() { "?" } else { &r.format };
-                writeln!(w, "     [{fmt}] {dims}  page: {}", r.page_url)?;
+                writeln!(w, "     [{fmt}] {dims}  page: {page_url}")?;
             }
             if let Some(dl) = downloaded {
                 if !dl.is_empty() {
@@ -238,9 +250,9 @@ pub fn write_fetch_to(w: &mut impl Write, mode: Mode, fetch: &FetchResult) -> st
         }
         Mode::Pretty => {
             if let Some(title) = &fetch.title {
-                writeln!(w, "{}", paint(title, "1"))?;
+                writeln!(w, "{}", paint(&sanitize_line(title), "1"))?;
             }
-            writeln!(w, "{}", paint(&fetch.url, "36"))?;
+            writeln!(w, "{}", paint(&sanitize_line(&fetch.url), "36"))?;
             writeln!(
                 w,
                 "{} chars{}",
@@ -248,7 +260,7 @@ pub fn write_fetch_to(w: &mut impl Write, mode: Mode, fetch: &FetchResult) -> st
                 if fetch.truncated { " (truncated)" } else { "" }
             )?;
             writeln!(w, "---")?;
-            writeln!(w, "{}", fetch.text)?;
+            writeln!(w, "{}", sanitize_text(&fetch.text))?;
         }
     }
     Ok(())
@@ -332,17 +344,71 @@ pub fn write_engines_to(
     Ok(())
 }
 
+/// Cache metadata for `webseek cache info`.
+pub fn write_cache_info(mode: Mode, info: &CacheInfo) -> std::io::Result<()> {
+    let out = std::io::stdout();
+    write_cache_info_to(&mut out.lock(), mode, info)
+}
+
+pub fn write_cache_info_to(
+    w: &mut impl Write,
+    mode: Mode,
+    info: &CacheInfo,
+) -> std::io::Result<()> {
+    match mode {
+        Mode::Json | Mode::Jsonl => writeln!(w, "{}", serde_json::to_string(info)?)?,
+        Mode::Pretty => {
+            writeln!(w, "Cache: {}", sanitize_line(&info.path))?;
+            writeln!(w, "Enabled: {}", info.enabled)?;
+            writeln!(w, "Entries: {} ({} expired)", info.entries, info.expired)?;
+            writeln!(w, "Size: {} / {} bytes", info.bytes, info.max_bytes)?;
+            writeln!(w, "TTL: {} seconds", info.ttl_secs)?;
+            writeln!(w, "Entry limit: {}", info.max_entries)?;
+            writeln!(w, "Schema: {}", info.schema_version)?;
+        }
+    }
+    Ok(())
+}
+
+/// Single-value command output (`config path`, `cache clear`).
+pub fn write_property(mode: Mode, key: &str, value: serde_json::Value) -> std::io::Result<()> {
+    let out = std::io::stdout();
+    write_property_to(&mut out.lock(), mode, key, value)
+}
+
+pub fn write_property_to(
+    w: &mut impl Write,
+    mode: Mode,
+    key: &str,
+    value: serde_json::Value,
+) -> std::io::Result<()> {
+    match mode {
+        Mode::Json | Mode::Jsonl => {
+            let mut object = serde_json::Map::new();
+            object.insert(key.to_string(), value);
+            writeln!(w, "{}", serde_json::Value::Object(object))
+        }
+        Mode::Pretty => {
+            let rendered = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            writeln!(w, "{}", sanitize_line(&rendered))
+        }
+    }
+}
+
 /// Progress note for stderr; callers gate these on `--verbose`.
 pub fn note(msg: &str) {
     if !is_quiet() {
-        eprintln!("[webseek] {msg}");
+        eprintln!("[webseek] {}", sanitize_line(msg));
     }
 }
 
 /// Non-fatal warning for stderr. Suppressed by `--quiet` like any other note.
 pub fn warn(msg: &str) {
     if !is_quiet() {
-        eprintln!("[webseek] {msg}");
+        eprintln!("[webseek] {}", sanitize_line(msg));
     }
 }
 
@@ -358,6 +424,38 @@ mod tests {
             url: "https://example.com".into(),
             snippet: "S".into(),
         }
+    }
+
+    #[test]
+    fn pretty_output_never_forwards_terminal_controls() {
+        set_color(ColorChoice::Never);
+        let result = SearchResult {
+            title: "safe\u{1b}[2Jtitle".into(),
+            url: "https://example.com/\u{202e}evil".into(),
+            snippet: "hello\u{1b}]0;pwned".into(),
+        };
+        let mut out = Vec::new();
+        write_search_to(&mut out, Mode::Pretty, "q", "duckduckgo", &[result]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn property_output_uses_the_requested_key_and_unquoted_pretty_text() {
+        let mut json_buf = Vec::new();
+        write_property_to(&mut json_buf, Mode::Json, "path", json!("/tmp/config.toml")).unwrap();
+        assert_eq!(to_value(&json_buf), json!({"path": "/tmp/config.toml"}));
+
+        let mut pretty_buf = Vec::new();
+        write_property_to(
+            &mut pretty_buf,
+            Mode::Pretty,
+            "path",
+            json!("/tmp/config.toml"),
+        )
+        .unwrap();
+        assert_eq!(pretty_buf, b"/tmp/config.toml\n");
     }
 
     fn sample_fetch() -> FetchResult {

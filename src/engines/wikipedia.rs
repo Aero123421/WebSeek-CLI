@@ -50,6 +50,11 @@ impl SearchEngine for Wikipedia {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let lang = opts.lang.as_deref().unwrap_or("en");
+        if !is_valid_wiki_lang(lang) {
+            return Err(Error::Config(format!(
+                "invalid --lang '{lang}' for wikipedia (expected a short language label such as en, ja, or zh-yue)"
+            )));
+        }
         let base = self
             .endpoint
             .clone()
@@ -73,20 +78,32 @@ impl SearchEngine for Wikipedia {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body, lang))
+        let body = crate::http::response_text(resp)?;
+        parse_results(&body, lang)
     }
 }
 
+fn is_valid_wiki_lang(lang: &str) -> bool {
+    let mut chars = lang.chars();
+    if !matches!(chars.next(), Some(c) if c.is_ascii_lowercase()) {
+        return false;
+    }
+    let rest: Vec<char> = chars.collect();
+    rest.len() <= 11
+        && rest
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        && !lang.ends_with('-')
+}
+
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str, lang: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<ApiResp>(body) else {
-        return Vec::new();
-    };
-    let Some(query) = resp.query else {
-        return Vec::new();
-    };
-    query
+pub fn parse_results(body: &str, lang: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<ApiResp>(body)
+        .map_err(|e| Error::Parse(format!("wikipedia response is not valid JSON: {e}")))?;
+    let query = resp
+        .query
+        .ok_or_else(|| Error::Parse("wikipedia response omitted query.search".into()))?;
+    Ok(query
         .search
         .into_iter()
         .map(|h| SearchResult {
@@ -94,7 +111,7 @@ pub fn parse_results(body: &str, lang: &str) -> Vec<SearchResult> {
             url: wiki_url(lang, &h.title),
             snippet: normalize_snippet(&strip_html(&h.snippet)),
         })
-        .collect()
+        .collect())
 }
 
 /// `https://{lang}.wikipedia.org/wiki/{Title_With_Underscores}`.
@@ -120,7 +137,7 @@ mod tests {
 
     #[test]
     fn parses_wikipedia_results_and_strips_markup() {
-        let r = parse_results(FIXTURE, "en");
+        let r = parse_results(FIXTURE, "en").unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "Tokio (software)");
         assert_eq!(r[0].url, "https://en.wikipedia.org/wiki/Tokio_(software)");
@@ -137,7 +154,8 @@ mod tests {
                 {"title":"Rust (programming language)","snippet":""}
             ]}}"#,
             "en",
-        );
+        )
+        .unwrap();
         // "C#" used to resolve to .../wiki/C with an empty fragment.
         assert_eq!(r[0].url, "https://en.wikipedia.org/wiki/C%23");
         assert_eq!(r[1].url, "https://en.wikipedia.org/wiki/Who's_Next%3F");
@@ -158,15 +176,26 @@ mod tests {
         let r = parse_results(
             r#"{"query":{"search":[{"title":"東京タワー","snippet":""}]}}"#,
             "ja",
-        );
+        )
+        .unwrap();
         assert_eq!(r.len(), 1);
         assert!(r[0].url.starts_with("https://ja.wikipedia.org/wiki/"));
         assert!(r[0].url.contains("%E6%9D%B1")); // 東 in UTF-8 percent-encoding
     }
 
     #[test]
-    fn malformed_json_yields_empty() {
-        assert!(parse_results("not json", "en").is_empty());
-        assert!(parse_results("{}", "en").is_empty());
+    fn malformed_json_is_an_error() {
+        assert!(parse_results("not json", "en").is_err());
+        assert!(parse_results("{}", "en").is_err());
+    }
+
+    #[test]
+    fn language_cannot_reshape_the_request_host() {
+        for lang in ["EN", "en.example.com", "en:443", "../en", "en-"] {
+            assert!(!is_valid_wiki_lang(lang), "{lang}");
+        }
+        for lang in ["en", "ja", "zh-yue", "be-tarask"] {
+            assert!(is_valid_wiki_lang(lang), "{lang}");
+        }
     }
 }

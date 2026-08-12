@@ -4,6 +4,39 @@
 //! behavior is identical on all platforms (this is where Windows/macOS/Linux
 //! filename differences are neutralized).
 
+use std::borrow::Cow;
+
+/// Terminal controls and bidirectional overrides that untrusted web content
+/// must never emit verbatim.
+fn is_dangerous_control(c: char) -> bool {
+    match c {
+        '\n' | '\t' => false,
+        c if (c as u32) < 0x20 || c as u32 == 0x7f => true,
+        c if ('\u{80}'..='\u{9f}').contains(&c) => true,
+        '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' => true,
+        c if ('\u{202a}'..='\u{202e}').contains(&c) => true,
+        c if ('\u{2066}'..='\u{2069}').contains(&c) => true,
+        _ => false,
+    }
+}
+
+/// Strip dangerous controls while retaining newlines and tabs.
+pub fn sanitize_text(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(is_dangerous_control) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.chars().filter(|c| !is_dangerous_control(*c)).collect())
+}
+
+/// Strip dangerous controls and line breaks from a one-line value.
+pub fn sanitize_line(s: &str) -> Cow<'_, str> {
+    let dangerous = |c: char| is_dangerous_control(c) || matches!(c, '\n' | '\t');
+    if !s.chars().any(dangerous) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.chars().filter(|c| !dangerous(*c)).collect())
+}
+
 /// Collapse whitespace to single spaces and cap at ~300 chars.
 pub fn normalize_snippet(s: &str) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -219,7 +252,8 @@ pub fn unescape_entities(s: &str) -> String {
             "apos" => out.push('\''),
             "nbsp" => out.push(' '),
             _ => match decode_numeric_entity(&ent) {
-                Some(ch) => out.push(ch),
+                Some(ch) if !is_dangerous_control(ch) => out.push(ch),
+                Some(_) => {}
                 None => {
                     out.push('&');
                     out.push_str(&ent);
@@ -313,6 +347,14 @@ mod tests {
         assert!(s.chars().count() <= 301);
         let short = normalize_snippet("  a\n b  c ");
         assert_eq!(short, "a b c");
+    }
+
+    #[test]
+    fn terminal_controls_are_removed_after_entity_decoding() {
+        assert_eq!(unescape_entities("a&#27;[2Jb"), "a[2Jb");
+        assert_eq!(unescape_entities("a&#x1b;]0;xb"), "a]0;xb");
+        assert_eq!(sanitize_line("a\n\u{1b}[31mb"), "a[31mb");
+        assert_eq!(sanitize_text("a\n\tb"), "a\n\tb");
     }
 
     #[test]

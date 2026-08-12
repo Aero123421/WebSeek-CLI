@@ -98,8 +98,7 @@ impl SearchOpts {
 
     /// Send a request to a **scraped** endpoint: paced, then retried.
     pub fn send(&self, rb: RequestBuilder) -> Result<Response> {
-        self.pacer.wait();
-        crate::http::send_with_retry(&rb)
+        crate::http::send_with_retry_paced(&rb, &self.pacer)
     }
 
     /// Send a request to an **official API**: identified, paced, retried.
@@ -131,8 +130,7 @@ impl ImageOpts {
     /// Both image engines scrape, so they keep the browser-like agent from the
     /// client; only pacing and retries are applied here.
     pub fn send(&self, rb: RequestBuilder) -> Result<Response> {
-        self.pacer.wait();
-        crate::http::send_with_retry(&rb)
+        crate::http::send_with_retry_paced(&rb, &self.pacer)
     }
 }
 

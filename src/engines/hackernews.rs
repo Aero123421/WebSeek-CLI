@@ -70,17 +70,17 @@ impl SearchEngine for HackerNews {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body))
+        let body = crate::http::response_text(resp)?;
+        parse_results(&body)
     }
 }
 
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<Resp>(body) else {
-        return Vec::new();
-    };
-    resp.hits
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<Resp>(body)
+        .map_err(|e| Error::Parse(format!("hackernews response is not valid JSON: {e}")))?;
+    Ok(resp
+        .hits
         .into_iter()
         .filter_map(|h| {
             let title = h.title.filter(|t| !t.is_empty())?;
@@ -99,7 +99,7 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&snippet),
             })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn parses_hn_hits_and_falls_back_to_item_url() {
-        let r = parse_results(FIXTURE);
+        let r = parse_results(FIXTURE).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "Tokio 1.0");
         assert_eq!(r[0].url, "https://tokio.rs/blog");
@@ -124,7 +124,9 @@ mod tests {
 
     #[test]
     fn skips_titleless_hits_and_bad_json() {
-        assert!(parse_results(r#"{"hits":[{"objectID":"9","title":null}]}"#).is_empty());
-        assert!(parse_results("nope").is_empty());
+        assert!(parse_results(r#"{"hits":[{"objectID":"9","title":null}]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_results("nope").is_err());
     }
 }

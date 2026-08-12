@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
+use crate::feed;
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::normalize_snippet;
 
@@ -82,7 +83,7 @@ impl SearchEngine for Bing {
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
+        let body = crate::http::response_text(resp)?;
         if crate::engines::looks_like_challenge(&body) {
             return Err(Error::RateLimited(
                 "bing served a bot-challenge page instead of results (IP reputation)".into(),
@@ -119,8 +120,8 @@ impl Bing {
         if !resp.status().is_success() {
             return None;
         }
-        let body = resp.text().ok()?;
-        let results = parse_rss(&body);
+        let body = crate::http::response_text(resp).ok()?;
+        let results = parse_rss(&body).ok()?;
         if results.is_empty() {
             return None;
         }
@@ -143,7 +144,14 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
         if let Some(a) = li.select(&link_sel).next() {
             title = a.text().collect::<String>().trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = decode_bing_url(href).unwrap_or_else(|| href.to_string());
+                let candidate = decode_bing_url(href).unwrap_or_else(|| href.to_string());
+                if Url::parse(&candidate)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .is_some()
+                {
+                    url = candidate;
+                }
             }
         }
         // A hit without a usable link is not a result: the JSON contract
@@ -169,44 +177,16 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
 /// format and is not behind a bot challenge, so it is Bing's preferred path.
 /// Only `<item>` segments are read, so channel-level `<title>`/`<link>` are
 /// never mistaken for results.
-pub fn parse_rss(body: &str) -> Vec<SearchResult> {
-    let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(start_rel) = rest.find("<item>") {
-        let after = &rest[start_rel + "<item>".len()..];
-        let Some(end_rel) = after.find("</item>") else {
-            break;
-        };
-        let item = &after[..end_rel];
-        rest = &after[end_rel + "</item>".len()..];
-
-        let link = crate::text::extract_tag(item, "link");
-        if link.is_empty() {
-            continue;
-        }
-        let title = crate::text::extract_tag(item, "title");
-        let desc = crate::text::extract_tag(item, "description");
-        out.push(SearchResult {
-            title: clean_text(&title),
-            url: crate::text::unescape_entities(link.trim()),
-            snippet: normalize_snippet(&clean_text(&desc)),
-        });
-    }
-    out
-}
-
-/// Strip an optional CDATA wrapper, then clean markup/entities to plain text.
-fn clean_text(raw: &str) -> String {
-    crate::text::strip_html(strip_cdata(raw))
-}
-
-fn strip_cdata(s: &str) -> &str {
-    let t = s.trim();
-    if let Some(inner) = t.strip_prefix("<![CDATA[") {
-        inner.strip_suffix("]]>").unwrap_or(inner)
-    } else {
-        t
-    }
+pub fn parse_rss(body: &str) -> Result<Vec<SearchResult>> {
+    Ok(feed::parse_entries(body)?
+        .into_iter()
+        .filter(|entry| !entry.link.is_empty())
+        .map(|entry| SearchResult {
+            title: normalize_snippet(&entry.title),
+            url: entry.link,
+            snippet: normalize_snippet(&crate::text::strip_html(&entry.summary)),
+        })
+        .collect())
 }
 
 /// Bing wraps external links in `bing.com/ck/a?...&u=<base64>` redirects.
@@ -386,7 +366,7 @@ mod tests {
 
     #[test]
     fn parses_bing_rss_and_ignores_channel() {
-        let results = parse_rss(RSS_FIXTURE);
+        let results = parse_rss(RSS_FIXTURE).unwrap();
         // Channel-level <title>/<link> must not be counted as results.
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "First & result");
@@ -398,8 +378,8 @@ mod tests {
 
     #[test]
     fn rss_empty_or_html_yields_nothing() {
-        assert!(parse_rss("").is_empty());
-        assert!(parse_rss(FIXTURE).is_empty()); // HTML, not RSS
+        assert!(parse_rss("").is_err());
+        assert!(parse_rss(FIXTURE).is_err()); // HTML, not RSS
     }
 
     #[test]

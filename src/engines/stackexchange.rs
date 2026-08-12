@@ -83,17 +83,17 @@ impl SearchEngine for StackExchange {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body))
+        let body = crate::http::response_text(resp)?;
+        parse_results(&body)
     }
 }
 
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<Resp>(body) else {
-        return Vec::new();
-    };
-    resp.items
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<Resp>(body)
+        .map_err(|e| Error::Parse(format!("stackexchange response is not valid JSON: {e}")))?;
+    Ok(resp
+        .items
         .into_iter()
         .filter(|it| !it.link.is_empty())
         .map(|it| {
@@ -111,7 +111,7 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&join_meta(&[&tags, &score, &answers])),
             }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn parses_questions_with_summary_snippet() {
-        let r = parse_results(FIXTURE);
+        let r = parse_results(FIXTURE).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "How to synchronise async runtimes");
         assert_eq!(r[0].url, "https://stackoverflow.com/q/1");
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(parse_results("nope").is_empty());
+    fn bad_json_is_an_error() {
+        assert!(parse_results("nope").is_err());
     }
 }

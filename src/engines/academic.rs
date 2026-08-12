@@ -94,16 +94,16 @@ impl SearchEngine for OpenAlex {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(openalex_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        openalex_parse(&body)
     }
 }
 
-pub fn openalex_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<OaResp>(body) else {
-        return Vec::new();
-    };
-    resp.results
+pub fn openalex_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<OaResp>(body)
+        .map_err(|e| Error::Parse(format!("openalex response is not valid JSON: {e}")))?;
+    Ok(resp
+        .results
         .into_iter()
         .filter_map(|w| {
             let title = w.display_name.or(w.title)?;
@@ -127,7 +127,7 @@ pub fn openalex_parse(body: &str) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&join_meta(&[&year, &venue, &cited])),
             })
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -211,19 +211,19 @@ impl SearchEngine for CrossRef {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(crossref_parse(&body))
+        let body = crate::http::response_text(resp)?;
+        crossref_parse(&body)
     }
 }
 
-pub fn crossref_parse(body: &str) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<CrResp>(body) else {
-        return Vec::new();
-    };
-    let Some(msg) = resp.message else {
-        return Vec::new();
-    };
-    msg.items
+pub fn crossref_parse(body: &str) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<CrResp>(body)
+        .map_err(|e| Error::Parse(format!("crossref response is not valid JSON: {e}")))?;
+    let msg = resp
+        .message
+        .ok_or_else(|| Error::Parse("crossref response omitted message.items".into()))?;
+    Ok(msg
+        .items
         .into_iter()
         .filter_map(|w| {
             let title = w.title.first()?.clone();
@@ -251,7 +251,7 @@ pub fn crossref_parse(body: &str) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&join_meta(&[&container, &year, &cited])),
             })
         })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +322,8 @@ impl SearchEngine for PubMed {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(pubmed_parse(&body, &ids))
+        let body = crate::http::response_text(resp)?;
+        pubmed_parse(&body, &ids)
     }
 }
 
@@ -360,23 +360,25 @@ impl PubMed {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        let Ok(parsed) = serde_json::from_str::<ESearchResp>(&body) else {
-            return Ok(Vec::new());
-        };
-        Ok(parsed.esearchresult.map(|r| r.idlist).unwrap_or_default())
+        let body = crate::http::response_text(resp)?;
+        let parsed = serde_json::from_str::<ESearchResp>(&body)
+            .map_err(|e| Error::Parse(format!("pubmed esearch response is not valid JSON: {e}")))?;
+        parsed
+            .esearchresult
+            .map(|r| r.idlist)
+            .ok_or_else(|| Error::Parse("pubmed esearch response omitted esearchresult".into()))
     }
 }
 
 /// Build results from an esummary body, preserving esearch's `ids` order.
-pub fn pubmed_parse(body: &str, ids: &[String]) -> Vec<SearchResult> {
-    let Ok(resp) = serde_json::from_str::<ESumResp>(body) else {
-        return Vec::new();
-    };
-    let Some(result) = resp.result else {
-        return Vec::new();
-    };
-    ids.iter()
+pub fn pubmed_parse(body: &str, ids: &[String]) -> Result<Vec<SearchResult>> {
+    let resp = serde_json::from_str::<ESumResp>(body)
+        .map_err(|e| Error::Parse(format!("pubmed esummary response is not valid JSON: {e}")))?;
+    let result = resp
+        .result
+        .ok_or_else(|| Error::Parse("pubmed esummary response omitted result".into()))?;
+    Ok(ids
+        .iter()
         .filter_map(|uid| {
             let doc = result.get(uid)?;
             let title = doc.get("title")?.as_str()?.to_string();
@@ -394,7 +396,7 @@ pub fn pubmed_parse(body: &str, ids: &[String]) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&join_meta(&[source, pubdate])),
             })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -407,7 +409,7 @@ mod tests {
           {"id":"https://openalex.org/W1","doi":"https://doi.org/10.1/x","display_name":"On Async","publication_year":2021,"cited_by_count":7,"primary_location":{"source":{"display_name":"J. Systems"}}},
           {"id":"https://openalex.org/W2","title":"No Doi Here"}
         ]}"#;
-        let r = openalex_parse(body);
+        let r = openalex_parse(body).unwrap();
         // Second work has no doi/id-as-url? it has id -> url ok.
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "On Async");
@@ -421,7 +423,7 @@ mod tests {
         let body = r#"{"message":{"items":[
           {"DOI":"10.1/x","title":["ASYNC 2020"],"URL":"https://doi.org/10.1/x","container-title":["IEEE ASYNC"],"published":{"date-parts":[[2020,5]]},"is-referenced-by-count":3}
         ]}}"#;
-        let r = crossref_parse(body);
+        let r = crossref_parse(body).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].title, "ASYNC 2020");
         assert_eq!(r[0].snippet, "IEEE ASYNC · 2020 · cited 3");
@@ -434,7 +436,7 @@ mod tests {
           "2":{"uid":"2","title":"Second paper","source":"Cell","pubdate":"2021 Feb"}
         }}"#;
         // Order follows the ids we pass (esearch order), not the JSON order.
-        let r = pubmed_parse(body, &["1".to_string(), "2".to_string()]);
+        let r = pubmed_parse(body, &["1".to_string(), "2".to_string()]).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "First paper");
         assert_eq!(r[0].url, "https://pubmed.ncbi.nlm.nih.gov/1/");
@@ -443,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(openalex_parse("x").is_empty());
-        assert!(crossref_parse("x").is_empty());
-        assert!(pubmed_parse("x", &["1".into()]).is_empty());
+    fn bad_json_is_an_error() {
+        assert!(openalex_parse("x").is_err());
+        assert!(crossref_parse("x").is_err());
+        assert!(pubmed_parse("x", &["1".into()]).is_err());
     }
 }

@@ -61,7 +61,9 @@ impl Harness {
             client: client(),
             opts: fetch_opts(),
             cache: Arc::new(Mutex::new(Cache::disabled())),
-            robots: Arc::new(Mutex::new(RobotsChecker::new())),
+            robots: Arc::new(Mutex::new(RobotsChecker::with_policy(
+                webseek::net::EgressPolicy::permissive(),
+            ))),
             pacer: Arc::new(Pacer::new(delay)),
         }
     }
@@ -74,6 +76,7 @@ impl Harness {
             robots: &self.robots,
             pacer: &self.pacer,
             respect_robots,
+            policy: webseek::net::EgressPolicy::permissive(),
         }
     }
 }
@@ -294,7 +297,12 @@ fn cached_pages_still_go_through_the_robots_gate() {
     let dir = std::env::temp_dir().join(format!("webseek-robots-cache-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let h = Harness {
-        cache: Arc::new(Mutex::new(Cache::load(dir.join("c.json"), 3600, 10))),
+        cache: Arc::new(Mutex::new(Cache::load(
+            dir.join("c.json"),
+            3600,
+            10,
+            webseek::cache::DEFAULT_MAX_BYTES,
+        ))),
         ..Harness::new()
     };
 
@@ -371,7 +379,12 @@ fn duplicate_urls_in_one_batch_reuse_the_cache() {
     let dir = std::env::temp_dir().join(format!("webseek-dup-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let h = Harness {
-        cache: Arc::new(Mutex::new(Cache::load(dir.join("c.json"), 3600, 10))),
+        cache: Arc::new(Mutex::new(Cache::load(
+            dir.join("c.json"),
+            3600,
+            10,
+            webseek::cache::DEFAULT_MAX_BYTES,
+        ))),
         ..Harness::new()
     };
     let url = format!("{}/dup", server.uri());

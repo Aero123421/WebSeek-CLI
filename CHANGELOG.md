@@ -7,15 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-12
+
 ### Added
 
-- One-liner installers: `install.sh` (Linux/macOS) and `install.ps1`
-  (Windows) detect the platform, download the latest release, verify the
-  SHA-256 checksum, and install `webseek` onto the PATH.
-- Tag-driven GitHub Release automation. Pushing a `v*` tag now validates the
-  project, builds Linux x86_64, Windows x86_64, macOS Intel (cross-compiled),
-  and macOS Apple Silicon binaries, and attaches checksummed archives to a
-  GitHub Release.
+- **Strict network egress policy.** HTTP(S)-only URLs, credential rejection,
+  private/loopback/link-local/reserved address blocking, redirect revalidation,
+  and guarded DNS resolution are now the default. `--allow-private`,
+  `--no-proxy`, and `--allow-external-schemes` are explicit escape hatches.
+- **Cache administration:** `webseek cache info`, `webseek cache clear`, and
+  `webseek config path`; the cache also has a configurable total byte budget
+  (`cache_max_bytes`, default 100 MiB).
+- **Batch failure policies:** `--fail-on-any-error` and
+  `--fail-if-all-error` preserve per-item output while making exit status
+  selectable for automation.
+- Paired boolean overrides: `--cache`/`--no-cache`,
+  `--fallback`/`--no-fallback`, and `--safe`/`--no-safe`.
+- Safe image overwrite is opt-in via `--overwrite` or `image_overwrite = true`.
+- Linux ARM64 release artifacts and release-binary smoke tests.
 - **`webseek completions <shell>`** — bash, zsh, fish, PowerShell, elvish.
 - **`--no-respect-robots`** to override `respect_robots = true` from the
   config for a single run. The robots error message already told users to do
@@ -49,6 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Network responses are bounded before decoding across engines, robots.txt,
+  page fetches and image downloads; unsupported fetch content types are
+  rejected explicitly rather than parsed as HTML.
+- Markdown links are resolved against the final redirected URL, while
+  active/local schemes and embedded credentials are dropped.
+- Image downloads no longer trust URL extensions or Content-Type: format is
+  checked from magic bytes, active SVG is rejected, dimensions cannot wrap,
+  existing files/symlinks are not followed, and files are private on Unix.
+- Bing RSS and Reddit Atom feeds now use a namespace-aware XML parser instead
+  of substring scans, correctly handling CDATA, attributes and alternate links.
+- Malformed JSON/error envelopes from API engines are parse errors instead of
+  confident zero-result answers; Wikipedia language labels can no longer
+  reshape the request host.
+- Pretty output strips terminal controls and bidi formatting, including
+  controls introduced by decoded numeric HTML entities.
+- Region parsing follows BCP-47 subtag order for inputs such as `fr-CA` and
+  `zh-Hant-TW`; country-only DuckDuckGo locales no longer fabricate values such
+  as `us-us` or `br-br`.
+- The POSIX installer replaces binaries atomically within the destination
+  filesystem; the PowerShell installer normalizes PATH entries before adding
+  one, avoiding duplicates.
 - **`max_chars` and `max_results` in `config.toml` were ignored.** The CLI
   defaults always won, because a clap `default_value_t` cannot be told apart
   from a value the user typed. Both options are now optional.
@@ -162,8 +192,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one error item instead of aborting the batch.
 - Declared MSRV corrected to 1.86 and verified in CI. The previous 1.75 was
   unchecked and had not been accurate for some time.
-- Expired cache entries are pruned on load; eviction is documented as FIFO
-  rather than LRU, which is what it always was.
+- The cache now implements true LRU recency, count and byte budgets,
+  cross-process locked merge-on-write, collision-safe versioned keys and
+  private Unix permissions. Expired entries are pruned on access/load.
 
 ## [0.2.0]
 
@@ -176,7 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (network/parse/HTTP), webseek tries the remaining engines in order until one
   succeeds. Opt out with `--no-fallback` or `fallback = false`.
 - **Transport hardening (`http` module).** Browser-like default headers
-  (Accept/Accept-Language/sec-ch-ua) to avoid tripping anti-bot challenges,
+  (Accept/Accept-Language/sec-ch-ua) to avoid tripping anti-bot challenges;
+  Accept-Language follows the effective `--lang` setting,
   plus polite retry with exponential backoff + jitter on 202/429/5xx/network
   errors. Engine-agnostic and dependency-light (no `rand`).
 - **Bing via RSS.** Bing text search now prefers the stable, structured RSS
@@ -241,6 +273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suite: parser unit tests with fixtures, engine integration tests
   against a local mock server (wiremock, no network).
 
-[Unreleased]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Aero123421/WebSeek-CLI/releases/tag/v0.1.0

@@ -92,13 +92,19 @@ if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
     fi
 fi
 
+# Stage inside the destination directory so the final rename stays atomic even
+# when the download temp directory is on another filesystem.
+staged="$install_dir/.webseek.tmp.$$"
 if [ -w "$install_dir" ]; then
-    mv "$tmpdir/webseek" "$install_dir/webseek"
+    cp "$tmpdir/webseek" "$staged"
+    chmod +x "$staged"
+    mv -f "$staged" "$install_dir/webseek"
 else
     note "Installing to $install_dir (requires sudo)"
-    sudo mv "$tmpdir/webseek" "$install_dir/webseek"
+    sudo cp "$tmpdir/webseek" "$staged"
+    sudo chmod +x "$staged"
+    sudo mv -f "$staged" "$install_dir/webseek"
 fi
-chmod +x "$install_dir/webseek" 2>/dev/null || true
 
 case ":$PATH:" in
     *":$install_dir:"*) ;;

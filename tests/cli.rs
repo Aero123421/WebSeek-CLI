@@ -48,6 +48,10 @@ impl Cli {
             .env_remove("WEBSEEK_CONFIG")
             .env_remove("NO_COLOR")
             .env("RUST_BACKTRACE", "0");
+        // Every wiremock endpoint is loopback. Production defaults must block
+        // it; this explicit escape hatch keeps these offline integration tests
+        // focused on their own behavior.
+        c.arg("--allow-private");
         c
     }
 
@@ -114,7 +118,7 @@ fn unsupported_scheme_is_rejected_before_any_request() {
         .args(["fetch", "file:///etc/passwd", "--json"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("unsupported scheme"));
+        .stderr(predicate::str::contains("scheme 'file' is not allowed"));
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +255,38 @@ fn batch_failures_are_data_while_single_failures_are_errors() {
         .args(["fetch", &bad, "--json", "--no-cache", "--delay", "0"])
         .assert()
         .code(1);
+
+    // Pipelines can request failure status without losing structured output.
+    let out = cli
+        .cmd()
+        .args([
+            "fetch",
+            &good,
+            &bad,
+            "--json",
+            "--no-cache",
+            "--delay",
+            "0",
+            "--fail-on-any-error",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_of(&out.stdout).as_array().unwrap().len(), 2);
+
+    cli.cmd()
+        .args([
+            "fetch",
+            &good,
+            &bad,
+            "--json",
+            "--no-cache",
+            "--delay",
+            "0",
+            "--fail-if-all-error",
+        ])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -416,6 +452,21 @@ fn init_writes_a_config_and_refuses_to_clobber_it() {
         .success();
 }
 
+#[test]
+fn config_path_is_config_free_and_machine_readable() {
+    let cli = Cli::new();
+    let target = cli.home.path().join("does-not-need-to-exist.toml");
+    let out = cli
+        .cmd()
+        .args(["config", "path", "--json"])
+        .arg("--config")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(json_of(&out.stdout)["path"], target.display().to_string());
+}
+
 // ---------------------------------------------------------------------------
 // robots.txt
 // ---------------------------------------------------------------------------
@@ -548,6 +599,49 @@ fn a_cached_page_is_served_when_the_origin_is_gone() {
     );
     assert_eq!(json_of(&out.stdout)["title"], "Fixture");
     assert!(String::from_utf8_lossy(&out.stderr).contains("cache hit"));
+}
+
+#[test]
+fn cache_info_and_clear_report_real_state() {
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(PAGE))
+            .mount(&server)
+            .await;
+    });
+    let cli = Cli::new();
+    let url = format!("{}/cached", server.uri());
+
+    cli.cmd()
+        .args(["fetch", &url, "--json", "--delay", "0"])
+        .assert()
+        .success();
+
+    let info = cli
+        .cmd()
+        .args(["cache", "info", "--json"])
+        .output()
+        .unwrap();
+    let info = json_of(&info.stdout);
+    assert_eq!(info["enabled"], true);
+    assert_eq!(info["entries"], 1);
+    assert!(info["bytes"].as_u64().unwrap() > 0);
+
+    let cleared = cli
+        .cmd()
+        .args(["cache", "clear", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_of(&cleared.stdout)["cleared"], 1);
+
+    let info = cli
+        .cmd()
+        .args(["cache", "info", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_of(&info.stdout)["entries"], 0);
 }
 
 #[test]

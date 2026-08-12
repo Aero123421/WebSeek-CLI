@@ -74,17 +74,16 @@ impl SearchEngine for Nominatim {
         if !resp.status().is_success() {
             return Err(Error::Http(resp.status().as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
-        Ok(parse_results(&body))
+        let body = crate::http::response_text(resp)?;
+        parse_results(&body)
     }
 }
 
 /// Pure parser (unit-tested against fixtures).
-pub fn parse_results(body: &str) -> Vec<SearchResult> {
-    let Ok(places) = serde_json::from_str::<Vec<Place>>(body) else {
-        return Vec::new();
-    };
-    places
+pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
+    let places = serde_json::from_str::<Vec<Place>>(body)
+        .map_err(|e| Error::Parse(format!("nominatim response is not valid JSON: {e}")))?;
+    Ok(places
         .into_iter()
         .map(|p| {
             let title = if p.display_name.is_empty() {
@@ -103,7 +102,7 @@ pub fn parse_results(body: &str) -> Vec<SearchResult> {
                 snippet: normalize_snippet(&join_meta(&[&p.place_type, &coords])),
             }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -117,7 +116,7 @@ mod tests {
 
     #[test]
     fn parses_places_with_osm_links() {
-        let r = parse_results(FIXTURE);
+        let r = parse_results(FIXTURE).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].title, "Tokyo, Japan");
         assert_eq!(r[0].url, "https://www.openstreetmap.org/relation/1543125");
@@ -126,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_yields_empty() {
-        assert!(parse_results("not json").is_empty());
+    fn bad_json_is_an_error() {
+        assert!(parse_results("not json").is_err());
     }
 }

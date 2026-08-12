@@ -18,17 +18,15 @@
 //!   nesting depth, and `--timeout` only bounds the HTTP request, not the work
 //!   afterwards; [`max_nesting_depth`] rejects pathological documents up front.
 
-use std::io::Read;
-
 use ego_tree::NodeRef;
-use reqwest::blocking::{Client, Response};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::blocking::Client;
 use scraper::node::Node;
 use scraper::{Html, Selector};
 use url::Url;
 
 use crate::error::{Error, Result};
 use crate::models::{FetchOpts, FetchResult};
+use crate::net::{self, EgressPolicy};
 use crate::text::truncate_chars;
 
 /// Default hard cap on downloaded body bytes (protects memory and bandwidth).
@@ -46,40 +44,78 @@ pub const MAX_LINES: usize = 10_000;
 pub const MAX_NESTING_DEPTH: usize = 1_500;
 
 /// Fetch `url` and extract the main content.
-pub fn fetch(client: &Client, url: &str, opts: &FetchOpts) -> Result<FetchResult> {
-    // Validate early so DNS/network errors don't shadow a malformed URL.
-    let parsed = Url::parse(url).map_err(|e| Error::Config(format!("invalid URL '{url}': {e}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(Error::Config(format!(
-            "unsupported scheme '{}' (only http/https)",
-            parsed.scheme()
-        )));
-    }
+pub fn fetch(
+    client: &Client,
+    url: &str,
+    opts: &FetchOpts,
+    policy: EgressPolicy,
+) -> Result<FetchResult> {
+    fetch_paced(client, url, opts, policy, &crate::pace::Pacer::disabled())
+}
 
-    let resp = crate::http::send_with_retry(&client.get(parsed))
-        .map_err(|e| Error::Network(format!("fetch failed for {url}: {e}")))?;
+pub(crate) fn fetch_paced(
+    client: &Client,
+    url: &str,
+    opts: &FetchOpts,
+    policy: EgressPolicy,
+    pacer: &crate::pace::Pacer,
+) -> Result<FetchResult> {
+    // Validate before cache/network work. IP literals do not pass through a
+    // DNS resolver, so the client-level guard alone is not sufficient.
+    let parsed = net::parse_checked(url, policy)?;
+
+    let resp = crate::http::send_with_retry_paced(&client.get(parsed.clone()), pacer)?;
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::Http(status.as_u16()));
     }
 
-    let charset_hint = charset_from_content_type(&resp);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if !is_extractable_content_type(content_type.as_deref()) {
+        return Err(Error::UnsupportedContent {
+            content_type: content_type.unwrap_or_default(),
+        });
+    }
 
-    // Stream with a byte cap so a huge page can't blow up memory.
-    let max_bytes = opts.max_bytes.max(1);
-    let mut reader = resp.take(max_bytes as u64);
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| Error::Network(format!("read body failed for {url}: {e}")))?;
-    let body_capped = bytes.len() >= max_bytes;
+    let body = crate::http::read_capped(resp, opts.max_bytes.max(1))?;
+    let raw = crate::http::decode_text(&body.bytes, body.content_type.as_deref());
+    let body_capped = body.truncated;
+    let final_url = Url::parse(&body.final_url).unwrap_or(parsed);
+    build_result_with_base(url, &raw, opts, body_capped, Some(&final_url))
+}
 
-    let raw = decode_body(&bytes, charset_hint.as_deref());
-    build_result(url, &raw, opts, body_capped)
+fn is_extractable_content_type(content_type: Option<&str>) -> bool {
+    let Some(raw) = content_type else { return true };
+    let base = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    base.is_empty()
+        || matches!(
+            base.as_str(),
+            "text/html" | "application/xhtml+xml" | "text/plain"
+        )
 }
 
 /// Turn a decoded document into a [`FetchResult`], honoring every cap.
+#[cfg(test)]
 fn build_result(url: &str, raw: &str, opts: &FetchOpts, body_capped: bool) -> Result<FetchResult> {
+    build_result_with_base(url, raw, opts, body_capped, None)
+}
+
+fn build_result_with_base(
+    url: &str,
+    raw: &str,
+    opts: &FetchOpts,
+    body_capped: bool,
+    base_url: Option<&Url>,
+) -> Result<FetchResult> {
     let max_chars = opts.max_chars.max(1);
 
     if opts.raw_html {
@@ -101,7 +137,7 @@ fn build_result(url: &str, raw: &str, opts: &FetchOpts, body_capped: bool) -> Re
         });
     }
 
-    let (title, text, lines_dropped) = extract_text_inner(raw, opts.markdown)?;
+    let (title, text, lines_dropped) = extract_text_inner_with_base(raw, opts.markdown, base_url)?;
     let total = text.chars().count();
     let over_char_cap = total > max_chars;
     let text = if over_char_cap {
@@ -118,13 +154,7 @@ fn build_result(url: &str, raw: &str, opts: &FetchOpts, body_capped: bool) -> Re
     })
 }
 
-/// Charset label advertised by the `Content-Type` response header, if any.
-fn charset_from_content_type(resp: &Response) -> Option<String> {
-    let value = resp.headers().get(CONTENT_TYPE)?.to_str().ok()?;
-    charset_from_content_type_str(value)
-}
-
-/// Pure half of [`charset_from_content_type`], for tests.
+/// Parse a charset label from a Content-Type header value.
 pub fn charset_from_content_type_str(value: &str) -> Option<String> {
     value.split(';').skip(1).find_map(|param| {
         let (k, v) = param.split_once('=')?;
@@ -184,6 +214,12 @@ fn meta_charset(bytes: &[u8]) -> Option<Vec<u8>> {
         rest = &rest[tag_end.min(rest.len())..];
     }
     None
+}
+
+/// Shared with the capped HTTP reader; kept crate-private because it is an
+/// implementation detail, not part of the library contract.
+pub(crate) fn meta_charset_label(bytes: &[u8]) -> Option<Vec<u8>> {
+    meta_charset(bytes)
 }
 
 /// Read `name=value` from a lower-cased tag body, quoted or bare.
@@ -414,6 +450,14 @@ pub fn extract_text(html: &str, markdown: bool) -> (Option<String>, String) {
 
 /// Returns `(title, text, lines_were_dropped)`.
 fn extract_text_inner(html: &str, markdown: bool) -> Result<(Option<String>, String, bool)> {
+    extract_text_inner_with_base(html, markdown, None)
+}
+
+fn extract_text_inner_with_base(
+    html: &str,
+    markdown: bool,
+    base_url: Option<&Url>,
+) -> Result<(Option<String>, String, bool)> {
     let depth = max_nesting_depth(html);
     if depth > MAX_NESTING_DEPTH {
         return Err(Error::Parse(format!(
@@ -429,7 +473,7 @@ fn extract_text_inner(html: &str, markdown: bool) -> Result<(Option<String>, Str
 
     let container = pick_container(&doc);
     let mut out = String::new();
-    walk(container, &mut out, markdown);
+    walk_with_base(container, &mut out, markdown, base_url);
     let (text, dropped) = post_process(&out);
     Ok((title, text, dropped))
 }
@@ -539,7 +583,17 @@ enum Step<'a> {
 /// overflow aborts the process rather than unwinding, so `catch_unwind` in the
 /// batch worker cannot contain it: one hostile URL would take down the whole
 /// run. An explicit stack makes depth a heap concern instead.
+#[cfg(test)]
 fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
+    walk_with_base(root, out, markdown, None);
+}
+
+fn walk_with_base(
+    root: NodeRef<'_, Node>,
+    out: &mut String,
+    markdown: bool,
+    base_url: Option<&Url>,
+) {
     let mut stack = vec![Step::Enter(root)];
 
     while let Some(step) = stack.pop() {
@@ -555,7 +609,7 @@ fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
                     // No link text: drop the '[' we optimistically emitted.
                     out.pop();
                 } else {
-                    out.push_str(&trimmed);
+                    out.push_str(&escape_markdown_link_text(&trimmed));
                     out.push_str("](");
                     out.push_str(&href);
                     out.push(')');
@@ -578,12 +632,14 @@ fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
                 let mut linked = false;
                 if markdown && tag == "a" {
                     if let Some(href) = e.attr("href") {
-                        out.push('[');
-                        stack.push(Step::CloseLink {
-                            start: out.len(),
-                            href: href.to_string(),
-                        });
-                        linked = true;
+                        if let Some(href) = safe_link(href, base_url) {
+                            out.push('[');
+                            stack.push(Step::CloseLink {
+                                start: out.len(),
+                                href,
+                            });
+                            linked = true;
+                        }
                     }
                 }
                 if !linked {
@@ -617,6 +673,38 @@ fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
             | Node::ProcessingInstruction(_) => {}
         }
     }
+}
+
+/// Resolve relative links against the final response URL and reject schemes
+/// that would become active content when copied or opened by an agent.
+fn safe_link(href: &str, base_url: Option<&Url>) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    let parsed = match Url::parse(href) {
+        Ok(parsed) => parsed,
+        Err(_) => base_url?.join(href).ok()?,
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(
+        parsed
+            .to_string()
+            .replace('\\', "%5C")
+            .replace('(', "%28")
+            .replace(')', "%29"),
+    )
+}
+
+fn escape_markdown_link_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 /// Line/cell separator emitted after an element, in both output modes.
@@ -711,12 +799,38 @@ mod tests {
         let (_, text) = extract_text(html, true);
         assert!(text.contains("## Intro"), "got: {text}");
         assert!(
-            text.contains("[Rust](https://rust-lang.org)"),
+            text.contains("[Rust](https://rust-lang.org/)"),
             "got: {text}"
         );
         assert!(text.contains("- first"), "lists need markers: {text}");
         assert!(text.contains("- second"), "got: {text}");
         assert!(text.contains("a | b"), "table cells survive: {text}");
+    }
+
+    #[test]
+    fn markdown_links_use_the_final_url_and_drop_active_schemes() {
+        let html = r#"<html><body><article>
+            <p><a href="../next?q=1">Next</a></p>
+            <p><a href="javascript:alert(1)">Do not run</a></p>
+            <p><a href="file:///etc/passwd">Local</a></p>
+        </article></body></html>"#;
+        let base = Url::parse("https://example.com/redirected/path/page").unwrap();
+        let (_, text, _) = extract_text_inner_with_base(html, true, Some(&base)).unwrap();
+        assert!(
+            text.contains("[Next](https://example.com/redirected/next?q=1)"),
+            "{text}"
+        );
+        assert!(text.contains("Do not run"));
+        assert!(!text.contains("javascript:"));
+        assert!(!text.contains("file:///"));
+        assert_eq!(
+            safe_link("https://example.com/a\n(b)", None).as_deref(),
+            Some("https://example.com/a%28b%29")
+        );
+        assert_eq!(
+            escape_markdown_link_text("[click]\\now"),
+            "\\[click\\]\\\\now"
+        );
     }
 
     #[test]

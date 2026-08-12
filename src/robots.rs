@@ -13,11 +13,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
-use url::Url;
-
-use crate::error::{Error, Result};
+use crate::error::Result;
+use crate::net::{self, EgressPolicy};
 use crate::pace::Pacer;
+use reqwest::blocking::Client;
 
 /// Cap on the robots.txt body we will read (Google's limit is 500 KiB).
 const MAX_ROBOTS_BYTES: usize = 512 * 1024;
@@ -183,6 +182,7 @@ pub fn parse_robots(body: &str) -> RobotsRules {
 #[derive(Default)]
 pub struct RobotsChecker {
     cache: HashMap<String, Option<RobotsRules>>,
+    policy: EgressPolicy,
 }
 
 impl RobotsChecker {
@@ -190,11 +190,17 @@ impl RobotsChecker {
         Self::default()
     }
 
+    pub fn with_policy(policy: EgressPolicy) -> Self {
+        Self {
+            cache: HashMap::new(),
+            policy,
+        }
+    }
+
     /// Returns `Ok(true)` when the URL may be fetched. `Ok(true)` on any lookup
     /// failure (missing robots.txt, network error) — robots is advisory.
     pub fn is_allowed(&mut self, client: &Client, pacer: &Pacer, url: &str) -> Result<bool> {
-        let parsed =
-            Url::parse(url).map_err(|e| Error::Config(format!("invalid URL '{url}': {e}")))?;
+        let parsed = net::parse_checked(url, self.policy)?;
         let host = parsed.host_str().unwrap_or("");
         // Preserve an explicit port so origins like `http://127.0.0.1:8080`
         // resolve their robots.txt on the right endpoint.
@@ -222,25 +228,20 @@ impl RobotsChecker {
     }
 
     fn fetch_rules(&self, client: &Client, pacer: &Pacer, origin: &str) -> Option<RobotsRules> {
-        use std::io::Read as _;
-
         let url = format!("{origin}/robots.txt");
-        pacer.wait();
-        let resp = client
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .ok()?;
+        let url = net::parse_checked(&url, self.policy).ok()?;
+        let rb = client.get(url).timeout(Duration::from_secs(5));
+        let resp = crate::http::send_with_retry_paced(&rb, pacer).ok()?;
         if !resp.status().is_success() {
             return None;
         }
         // Bounded read: a hostile robots.txt should not be able to exhaust
         // memory on a request we make automatically.
-        let mut buf = Vec::new();
-        resp.take(MAX_ROBOTS_BYTES as u64)
-            .read_to_end(&mut buf)
-            .ok()?;
-        Some(parse_robots(&String::from_utf8_lossy(&buf)))
+        let body = crate::http::read_capped(resp, MAX_ROBOTS_BYTES).ok()?;
+        if body.truncated {
+            return None;
+        }
+        Some(parse_robots(&String::from_utf8_lossy(&body.bytes)))
     }
 }
 

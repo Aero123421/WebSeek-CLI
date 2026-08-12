@@ -7,7 +7,7 @@
 //!
 //! Both parsers are pure functions, unit-tested with fixtures.
 
-use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -19,6 +19,7 @@ use url::Url;
 use crate::engines::{dedupe_and_truncate, ImageEngine};
 use crate::error::{Error, Result};
 use crate::models::{ImageOpts, ImageResult};
+use crate::net::EgressPolicy;
 use crate::pace::Pacer;
 use crate::robots::RobotsChecker;
 use crate::text::sanitize_name;
@@ -99,7 +100,7 @@ impl ImageEngine for BingImages {
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
+        let body = crate::http::response_text(resp)?;
         // Without this the text engine reported challenges but the image
         // engine silently returned zero results, so fallback never fired.
         if crate::engines::looks_like_challenge(&body) {
@@ -126,7 +127,7 @@ impl ImageEngine for DuckDuckGoImages {
         let vqd = fetch_vqd(client, query, opts, &self.page_base)?;
         let mut params = vec![("q", query), ("o", "json"), ("vqd", vqd.as_str())];
         if opts.safe {
-            params.push(("p", "1"));
+            params.push(("kp", "1"));
         }
         let url = Url::parse_with_params(&self.json_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
@@ -143,7 +144,7 @@ impl ImageEngine for DuckDuckGoImages {
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
+        let body = crate::http::response_text(resp)?;
         Ok(dedupe_and_truncate(
             parse_ddg_json(&body)?,
             opts.count,
@@ -156,7 +157,7 @@ impl ImageEngine for DuckDuckGoImages {
 fn fetch_vqd(client: &Client, query: &str, opts: &ImageOpts, page_base: &str) -> Result<String> {
     let mut params = vec![("q", query), ("iax", "images"), ("ia", "images")];
     if opts.safe {
-        params.push(("p", "1"));
+        params.push(("kp", "1"));
     }
     let url = Url::parse_with_params(page_base, &params)
         .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
@@ -172,7 +173,7 @@ fn fetch_vqd(client: &Client, query: &str, opts: &ImageOpts, page_base: &str) ->
     if !status.is_success() {
         return Err(Error::Http(status.as_u16()));
     }
-    let body = resp.text().map_err(Error::from)?;
+    let body = crate::http::response_text(resp)?;
     extract_vqd(&body).ok_or_else(|| {
         Error::Parse(
             "could not locate vqd token in duckduckgo image page (page layout changed?)".into(),
@@ -234,8 +235,8 @@ pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
                 .and_then(|u| u.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            width: v.get("murlw").and_then(|n| n.as_u64()).map(|n| n as u32),
-            height: v.get("murlh").and_then(|n| n.as_u64()).map(|n| n as u32),
+            width: checked_dim(v.get("murlw")),
+            height: checked_dim(v.get("murlh")),
             format: format_from_url(url),
         });
     }
@@ -246,9 +247,10 @@ pub fn parse_bing_html(html: &str) -> Vec<ImageResult> {
 pub fn parse_ddg_json(body: &str) -> Result<Vec<ImageResult>> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| Error::Parse(format!("i.js response is not JSON: {e}")))?;
-    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
-        return Ok(Vec::new());
-    };
+    let results = v
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| Error::Parse("i.js response omitted results array".into()))?;
     let mut out = Vec::new();
     for item in results {
         let Some(url) = item.get("image").and_then(|u| u.as_str()) else {
@@ -266,15 +268,16 @@ pub fn parse_ddg_json(body: &str) -> Result<Vec<ImageResult>> {
                 .and_then(|u| u.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            width: item.get("width").and_then(|n| n.as_u64()).map(|n| n as u32),
-            height: item
-                .get("height")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32),
+            width: checked_dim(item.get("width")),
+            height: checked_dim(item.get("height")),
             format: format_from_url(url),
         });
     }
     Ok(out)
+}
+
+fn checked_dim(value: Option<&Value>) -> Option<u32> {
+    u32::try_from(value?.as_u64()?).ok()
 }
 
 fn format_from_url(url: &str) -> String {
@@ -301,17 +304,24 @@ pub struct DownloadCtx<'a> {
     pub robots: Option<&'a Mutex<RobotsChecker>>,
     pub limit: usize,
     pub max_bytes: usize,
+    /// Network destinations permitted for untrusted result URLs.
+    pub policy: EgressPolicy,
+    /// Whether an existing generated path may be replaced.
+    pub overwrite: bool,
 }
 
 /// Download image results into `dir`, at most `ctx.limit` of them, skipping
 /// anything larger than `ctx.max_bytes`. Returns saved paths.
 ///
 /// Notes on the request pattern, which used to be neither gentle nor safe:
-/// - **One request per image.** The size pre-check is a `HEAD`, and falls back
-///   to the streaming cap when a server does not support it — the old code
-///   issued a throwaway `GET` and then a second `GET` for the same file.
+/// - **One request per image.** The streaming cap makes a separate HEAD/GET
+///   preflight unnecessary.
 /// - **Bounded in memory.** The body is streamed with a hard cap instead of
 ///   being buffered in full and measured afterwards.
+/// - **Content is verified.** Extensions and Content-Type are hints; magic
+///   bytes decide whether the response is really an image.
+/// - **No implicit overwrite.** `create_new` refuses existing files and
+///   symlinks unless the caller explicitly opts in.
 /// - **Paced.** Downloads go through the same limiter as every other request.
 /// - **Per-file failures are skipped**, not fatal: one unwritable name must
 ///   not discard the images that already downloaded successfully.
@@ -334,25 +344,15 @@ pub fn download(ctx: &DownloadCtx<'_>, results: &[ImageResult], dir: &Path) -> R
             }
         }
 
-        // Cheap size pre-check. A server that rejects HEAD just means we rely
-        // on the streaming cap below instead of paying for a second request.
-        ctx.pacer.wait();
-        if let Ok(head) = ctx.client.head(&img.url).send() {
-            if head.status().is_success() {
-                if let Some(len) = head.content_length() {
-                    if len > ctx.max_bytes as u64 {
-                        crate::output::warn(&format!(
-                            "skipping {} ({len} bytes > {} byte limit)",
-                            img.url, ctx.max_bytes
-                        ));
-                        continue;
-                    }
-                }
+        let url = match crate::net::parse_checked(&img.url, ctx.policy) {
+            Ok(url) => url,
+            Err(e) => {
+                crate::output::warn(&format!("skipping {} ({e})", img.url));
+                continue;
             }
-        }
+        };
 
-        ctx.pacer.wait();
-        let resp = match ctx.client.get(&img.url).send() {
+        let resp = match crate::http::send_with_retry_paced(&ctx.client.get(url), ctx.pacer) {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 crate::output::warn(&format!("skipping {} (HTTP {})", img.url, r.status()));
@@ -364,31 +364,40 @@ pub fn download(ctx: &DownloadCtx<'_>, results: &[ImageResult], dir: &Path) -> R
             }
         };
 
-        let ext = extension_for(img, &resp);
-
-        // Read one byte past the limit so an oversized body is detected
-        // without ever holding more than the cap in memory.
-        let mut bytes = Vec::new();
-        let read = resp
-            .take(ctx.max_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .is_ok();
-        if !read {
-            crate::output::warn(&format!("skipping {} (read failed)", img.url));
-            continue;
-        }
-        if bytes.len() > ctx.max_bytes {
+        let body = match crate::http::read_capped(resp, ctx.max_bytes) {
+            Ok(body) => body,
+            Err(e) => {
+                crate::output::warn(&format!("skipping {} ({e})", img.url));
+                continue;
+            }
+        };
+        if body.truncated {
             crate::output::warn(&format!(
                 "skipping {} (larger than the {} byte limit)",
                 img.url, ctx.max_bytes
             ));
             continue;
         }
+        let Some(ext) = sniff_image_format(&body.bytes) else {
+            let content_type = body.content_type.as_deref().unwrap_or("unknown");
+            crate::output::warn(&format!(
+                "skipping {} (response is not a supported image; Content-Type: {content_type})",
+                img.url
+            ));
+            continue;
+        };
+        if ext == "svg" {
+            crate::output::warn(&format!(
+                "skipping {} (SVG may contain active content)",
+                img.url
+            ));
+            continue;
+        }
 
         let name = sanitize_name(&img.title);
         let filename = dir.join(format!("{:04}_{name}.{ext}", i + 1));
-        if let Err(e) = std::fs::write(&filename, &bytes) {
-            crate::output::warn(&format!("cannot write {}: {e}", filename.display()));
+        if let Err(e) = write_image_file(&filename, &body.bytes, ctx.overwrite) {
+            crate::output::warn(&e.to_string());
             continue;
         }
         saved.push(filename.display().to_string());
@@ -396,25 +405,78 @@ pub fn download(ctx: &DownloadCtx<'_>, results: &[ImageResult], dir: &Path) -> R
     Ok(saved)
 }
 
-/// File extension for a downloaded image: the URL's, else the `Content-Type`.
-///
-/// URLs that route through a redirector carry no extension, and a file called
-/// `.img` opens in nothing.
-fn extension_for(img: &ImageResult, resp: &reqwest::blocking::Response) -> String {
-    if !img.format.is_empty() {
-        return img.format.clone();
+/// Identify an image by magic bytes. A URL suffix or header can claim JPEG
+/// while the response is an HTML error page, so neither is authoritative.
+fn sniff_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("jpg");
     }
-    let mime = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    extension_for_mime(&mime).unwrap_or("img").to_string()
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    if bytes.starts_with(&[0, 0, 1, 0]) {
+        return Some("ico");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") {
+        return Some("avif");
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let trimmed = head.trim_start_matches('\u{feff}').trim_start();
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && head.contains("<svg")) {
+        return Some("svg");
+    }
+    None
+}
+
+fn write_image_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
+    if overwrite {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".webseek-image-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(|e| Error::Network(format!("cannot stage {}: {e}", path.display())))?;
+        tmp.write_all(bytes)
+            .map_err(|e| Error::Network(format!("cannot write {}: {e}", path.display())))?;
+        tmp.flush()
+            .map_err(|e| Error::Network(format!("cannot flush {}: {e}", path.display())))?;
+        tmp.persist(path).map_err(|e| {
+            Error::Network(format!("cannot replace {}: {}", path.display(), e.error))
+        })?;
+        return Ok(());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Config(format!(
+                "{} already exists (use --overwrite to replace it)",
+                path.display()
+            ))
+        } else {
+            Error::Network(format!("cannot write {}: {e}", path.display()))
+        }
+    })?;
+    file.write_all(bytes)
+        .map_err(|e| Error::Network(format!("cannot write {}: {e}", path.display())))
 }
 
 /// Map an image MIME type to a conventional extension.
@@ -465,6 +527,14 @@ mod tests {
     }
 
     #[test]
+    fn oversized_dimensions_are_dropped_instead_of_wrapping() {
+        let value = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert_eq!(checked_dim(Some(&value)), None);
+        let value = serde_json::json!(800);
+        assert_eq!(checked_dim(Some(&value)), Some(800));
+    }
+
+    #[test]
     fn extracts_vqd_token() {
         assert_eq!(
             extract_vqd(r#"<html>var vqd="12345-abc";</html>"#).as_deref(),
@@ -487,6 +557,11 @@ mod tests {
     }
 
     #[test]
+    fn ddg_api_error_object_is_not_reported_as_zero_results() {
+        assert!(parse_ddg_json(r#"{"error":"rate limit"}"#).is_err());
+    }
+
+    #[test]
     fn format_from_url_works() {
         assert_eq!(format_from_url("https://x.com/a.JPG?w=1"), "jpg");
         assert_eq!(format_from_url("https://x.com/a.webp"), "webp");
@@ -494,11 +569,59 @@ mod tests {
     }
 
     #[test]
-    fn content_type_supplies_an_extension_when_the_url_has_none() {
+    fn known_image_mimes_map_to_conventional_extensions() {
         // Redirector URLs carry no extension; ".img" opens in nothing.
         assert_eq!(extension_for_mime("image/jpeg"), Some("jpg"));
         assert_eq!(extension_for_mime("image/webp"), Some("webp"));
         assert_eq!(extension_for_mime("image/svg+xml"), Some("svg"));
         assert_eq!(extension_for_mime("text/html"), None);
+    }
+
+    #[test]
+    fn magic_bytes_override_untrusted_names_and_headers() {
+        assert_eq!(sniff_image_format(&[0xff, 0xd8, 0xff, 0xe0]), Some("jpg"));
+        assert_eq!(
+            sniff_image_format(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            Some("png")
+        );
+        assert_eq!(sniff_image_format(b"GIF89a..."), Some("gif"));
+        assert_eq!(
+            sniff_image_format(b"<!doctype html><title>404</title>"),
+            None
+        );
+        assert_eq!(sniff_image_format(b"<svg xmlns='x'></svg>"), Some("svg"));
+    }
+
+    #[test]
+    fn image_files_do_not_overwrite_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0001_image.jpg");
+        std::fs::write(&path, b"original").unwrap();
+
+        let err = write_image_file(&path, b"replacement", false).unwrap_err();
+        assert!(err.to_string().contains("--overwrite"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+
+        write_image_file(&path, b"replacement", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_files_do_not_follow_existing_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("0001_image.jpg");
+        std::fs::write(&target, b"secret").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(write_image_file(&link, b"attacker", false).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
+
+        write_image_file(&link, b"replacement", true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
+        assert_eq!(std::fs::read(&link).unwrap(), b"replacement");
     }
 }

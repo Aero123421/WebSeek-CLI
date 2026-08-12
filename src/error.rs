@@ -27,6 +27,12 @@ pub enum Error {
     NoResults(String),
     /// Fetching was refused by the site's robots.txt.
     Robots(String),
+    /// The request was refused by the network-egress policy (SSRF guard).
+    Blocked(String),
+    /// A response body exceeded the configured byte cap.
+    TooLarge { limit: usize },
+    /// The response type cannot safely be handled by the requested operation.
+    UnsupportedContent { content_type: String },
 }
 
 impl Error {
@@ -40,6 +46,9 @@ impl Error {
             Error::Config(_) => "config",
             Error::NoResults(_) => "no_results",
             Error::Robots(_) => "robots",
+            Error::Blocked(_) => "blocked_by_policy",
+            Error::TooLarge { .. } => "response_too_large",
+            Error::UnsupportedContent { .. } => "unsupported_content_type",
         }
     }
 
@@ -72,6 +81,11 @@ impl fmt::Display for Error {
             Error::Config(msg) => write!(f, "configuration error: {msg}"),
             Error::NoResults(msg) => write!(f, "{msg}"),
             Error::Robots(msg) => write!(f, "{msg}"),
+            Error::Blocked(msg) => write!(f, "blocked by egress policy: {msg}"),
+            Error::TooLarge { limit } => write!(f, "response exceeded the {limit}-byte limit"),
+            Error::UnsupportedContent { content_type } => {
+                write!(f, "unsupported content type '{content_type}'")
+            }
         }
     }
 }
@@ -95,6 +109,8 @@ mod tests {
         assert_eq!(Error::Http(404).kind(), "http");
         assert_eq!(Error::RateLimited("x".into()).kind(), "rate_limited");
         assert_eq!(Error::robots_blocked("https://x").kind(), "robots");
+        assert_eq!(Error::Blocked("x".into()).kind(), "blocked_by_policy");
+        assert_eq!(Error::TooLarge { limit: 1 }.kind(), "response_too_large");
     }
 
     #[test]
@@ -106,6 +122,8 @@ mod tests {
         // The user's own mistakes must surface, not silently reroute.
         assert!(!Error::Config("bad engine".into()).is_engine_retryable());
         assert!(!Error::robots_blocked("https://x").is_engine_retryable());
+        assert!(!Error::Blocked("x".into()).is_engine_retryable());
+        assert!(!Error::TooLarge { limit: 1 }.is_engine_retryable());
     }
 
     #[test]

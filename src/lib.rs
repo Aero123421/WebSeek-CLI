@@ -7,8 +7,10 @@ pub mod cli;
 pub mod config;
 pub mod engines;
 pub mod error;
+pub mod feed;
 pub mod http;
 pub mod models;
+pub mod net;
 pub mod output;
 pub mod pace;
 pub mod reader;
@@ -27,10 +29,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{BatchCtx, BatchItem};
 use crate::cache::Cache;
-use crate::cli::{Cli, Command};
+use crate::cli::{CacheCommand, Cli, Command, ConfigCommand};
 use crate::engines::{engine_by_name, image_engine_by_name};
 use crate::error::Error;
 use crate::models::{FetchOpts, SearchOpts, SearchResult};
+use crate::net::EgressPolicy;
 use crate::output::{write_fetch, write_fetch_batch, write_images, write_search, Mode};
 use crate::pace::Pacer;
 use crate::robots::RobotsChecker;
@@ -70,28 +73,77 @@ pub fn run() -> Result<()> {
             clap_complete::generate(*shell, &mut cmd, bin, &mut std::io::stdout());
             return Ok(());
         }
+        Command::Config {
+            action: ConfigCommand::Path,
+        } => {
+            let path = config::Config::effective_path(cli.config.as_deref());
+            output::write_property(
+                mode,
+                "path",
+                serde_json::Value::String(path.display().to_string()),
+            )?;
+            return Ok(());
+        }
         _ => {}
     }
 
     let cfg = config::Config::load(cli.config.as_deref())?;
+
+    if let Command::Cache { action } = &cli.cmd {
+        let path = cache::default_cache_path();
+        match action {
+            CacheCommand::Info => {
+                let max_entries = effective_cache_entries(&cli, &cfg);
+                let cache = Cache::load(path, cfg.cache_ttl_secs, max_entries, cfg.cache_max_bytes);
+                output::write_cache_info(mode, &cache.info())?;
+            }
+            CacheCommand::Clear => {
+                let cleared = Cache::clear_path(&path)
+                    .map_err(|e| Error::Config(format!("cannot clear cache: {e}")))?;
+                output::write_property(mode, "cleared", serde_json::json!(cleared))?;
+            }
+        }
+        return Ok(());
+    }
+
     config::validate_engine(&cfg.engine)?;
     config::validate_image_engine(&cfg.image_engine)?;
 
     let delay = cli.delay.map(Duration::from_millis).unwrap_or(cfg.delay);
     let timeout = cli.timeout.map(Duration::from_secs).unwrap_or(cfg.timeout);
     let user_agent = cli.ua.as_deref().unwrap_or(&cfg.user_agent);
-    let client = http::build_client(timeout, user_agent)?;
+    let policy = EgressPolicy {
+        allow_private: cli.allow_private || cfg.allow_private_network,
+    };
+    let allow_proxy = !cli.no_proxy && cfg.allow_proxy;
+    if allow_proxy && !policy.allow_private {
+        if let Some(var) = net::active_proxy_env() {
+            output::warn(&format!(
+                "${var} is set: a proxy resolves destinations outside webseek's \
+                 private-network/DNS-rebinding guard; pass --no-proxy for the \
+                 strongest egress guarantee"
+            ));
+        }
+    }
+    let command_lang = match &cli.cmd {
+        Command::Search { lang, .. } => lang.as_deref(),
+        _ => None,
+    };
+    let accept_language = http::accept_language_for(command_lang.or(cfg.lang.as_deref()));
+    let client = http::build_client(timeout, user_agent, &accept_language, policy, allow_proxy)?;
 
-    let cache = Arc::new(Mutex::new(if cli.no_cache || cfg.cache_max_entries == 0 {
+    let cache_entries = effective_cache_entries(&cli, &cfg);
+    let cache = Arc::new(Mutex::new(if cache_entries == 0 {
         Cache::disabled()
     } else {
         Cache::load(
             cache::default_cache_path(),
             cfg.cache_ttl_secs,
-            cfg.cache_max_entries,
+            cache_entries,
+            cfg.cache_max_bytes,
         )
     }));
-    let robots = Arc::new(Mutex::new(RobotsChecker::new()));
+    let robots = Arc::new(Mutex::new(RobotsChecker::with_policy(policy)));
     let pacer = Arc::new(Pacer::new(delay));
 
     let ctx = Ctx {
@@ -102,15 +154,26 @@ pub fn run() -> Result<()> {
         cache: &cache,
         robots: &robots,
         pacer: &pacer,
+        policy,
     };
     let outcome = run_inner(&ctx);
-    if let Ok(c) = cache.lock() {
+    if let Ok(mut c) = cache.lock() {
         c.save(); // best-effort, even when the command failed
     }
     // Flush explicitly so a write failure is reported here rather than being
     // swallowed when stdout is dropped at exit.
     let _ = std::io::stdout().flush();
     outcome
+}
+
+fn effective_cache_entries(cli: &Cli, cfg: &config::Config) -> usize {
+    if cli.no_cache {
+        0
+    } else if cli.cache {
+        cfg.cache_max_entries.max(1)
+    } else {
+        cfg.cache_max_entries
+    }
 }
 
 /// Everything the subcommands share.
@@ -122,6 +185,7 @@ struct Ctx<'a> {
     cache: &'a Arc<Mutex<Cache>>,
     robots: &'a Arc<Mutex<RobotsChecker>>,
     pacer: &'a Arc<Pacer>,
+    policy: EgressPolicy,
 }
 
 impl Ctx<'_> {
@@ -138,6 +202,7 @@ impl Ctx<'_> {
         lang: &Option<String>,
         region: &Option<String>,
         safe: bool,
+        no_safe: bool,
     ) -> SearchOpts {
         SearchOpts {
             // An explicit flag wins; otherwise the config value applies.
@@ -146,7 +211,11 @@ impl Ctx<'_> {
                 .clamp(1, cli::MAX_RESULTS),
             lang: lang.clone().or_else(|| self.cfg.lang.clone()),
             region: region.clone().or_else(|| self.cfg.region.clone()),
-            safe: safe || self.cfg.safe_search,
+            safe: if no_safe {
+                false
+            } else {
+                safe || self.cfg.safe_search
+            },
             // `--ua` overrides the API agent too. The flag says "override the
             // User-Agent header"; honouring it on scraped endpoints only would
             // silently make it a no-op for eleven of the thirteen engines.
@@ -171,7 +240,11 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
     let respect_robots = ctx.cli.respect_robots(ctx.cfg.respect_robots);
 
     match &ctx.cli.cmd {
-        Command::Init | Command::Engines | Command::Completions { .. } => {
+        Command::Init
+        | Command::Engines
+        | Command::Completions { .. }
+        | Command::Cache { .. }
+        | Command::Config { .. } => {
             unreachable!("handled before config load")
         }
 
@@ -182,10 +255,11 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             lang,
             region,
             safe,
+            no_safe,
             open,
         } => {
             let name = engine.as_deref().unwrap_or(&ctx.cfg.engine);
-            let opts = ctx.search_opts(*count, lang, region, *safe);
+            let opts = ctx.search_opts(*count, lang, region, *safe, *no_safe);
             ctx.trace(&format!("searching '{query}' via {name}"));
 
             let (results, engine_used) = search_with_cache(ctx, name, query, &opts)?;
@@ -200,8 +274,7 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
                 let target = results.get(i).ok_or_else(|| {
                     Error::NoResults(format!("no result #{idx} (only {} found)", results.len()))
                 })?;
-                open::that(&target.url)
-                    .map_err(|e| Error::Network(format!("cannot open browser: {e}")))?;
+                open_result_url(&target.url, ctx.cli.allow_external_schemes)?;
             }
             Ok(())
         }
@@ -213,14 +286,15 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             html,
             array,
             jobs,
+            fail_on_any_error,
+            fail_if_all_error,
             open,
         } => {
             if *open {
                 if urls.len() != 1 {
                     return Err(Error::Config("--open requires exactly one URL".to_string()).into());
                 }
-                open::that(&urls[0])
-                    .map_err(|e| Error::Network(format!("cannot open browser: {e}")))?;
+                open_result_url(&urls[0], ctx.cli.allow_external_schemes)?;
                 return Ok(());
             }
 
@@ -237,6 +311,7 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
                 robots: ctx.robots,
                 pacer: ctx.pacer,
                 respect_robots,
+                policy: ctx.policy,
             };
 
             // One URL without `--array` keeps the single-object contract, and
@@ -261,6 +336,13 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             let items = batch::fetch_many(&batch_ctx, urls, *jobs);
             write_fetch_batch(ctx.mode, &items)?;
             summarize_batch(ctx, &items);
+            let failed = items.iter().filter(|item| item.is_err()).count();
+            if *fail_on_any_error && failed > 0 {
+                anyhow::bail!("{failed} of {} URLs failed", items.len());
+            }
+            if *fail_if_all_error && !items.is_empty() && failed == items.len() {
+                anyhow::bail!("all {failed} URLs failed");
+            }
             Ok(())
         }
 
@@ -272,12 +354,18 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             limit,
             max_bytes,
             safe,
+            no_safe,
+            overwrite,
         } => {
             let name = engine.as_deref().unwrap_or(&ctx.cfg.image_engine);
             let count = count
                 .unwrap_or(ctx.cfg.max_results)
                 .clamp(1, cli::MAX_RESULTS);
-            let safe = *safe || ctx.cfg.safe_search;
+            let safe = if *no_safe {
+                false
+            } else {
+                *safe || ctx.cfg.safe_search
+            };
             ctx.trace(&format!("searching images for '{query}' via {name}"));
 
             let (results, engine_used) = images_with_cache(ctx, name, query, count, safe)?;
@@ -289,6 +377,8 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
                         robots: respect_robots.then_some(ctx.robots.as_ref()),
                         limit: limit.unwrap_or(results.len()),
                         max_bytes: max_bytes.unwrap_or(ctx.cfg.image_max_bytes),
+                        policy: ctx.policy,
+                        overwrite: *overwrite || ctx.cfg.image_overwrite,
                     };
                     Some(engines::images::download(&dl_ctx, &results, dir)?)
                 }
@@ -298,6 +388,13 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn open_result_url(raw: &str, allow_external_schemes: bool) -> error::Result<()> {
+    let url =
+        url::Url::parse(raw).map_err(|e| Error::Config(format!("invalid URL '{raw}': {e}")))?;
+    net::check_open_url(&url, allow_external_schemes)?;
+    open::that(raw).map_err(|e| Error::Network(format!("cannot open browser: {e}")))
 }
 
 /// Tell the user on stderr how a partially-failed batch went; stdout stays
@@ -374,18 +471,18 @@ fn search_with_cache(
 ) -> Result<(Vec<SearchResult>, &'static str)> {
     // Validate up front: an unknown engine is the user's mistake and must
     // surface as-is rather than being quietly rerouted.
-    engine_by_name(name)?;
+    let requested = engine_by_name(name)?.name();
 
-    let key = cache::search_key(name, query, opts);
+    let key = cache::search_key(requested, query, opts);
     if let Some(hit) = cached::<SearchResult>(ctx, &key) {
         ctx.trace(&format!("{} results (cache hit)", hit.1));
         return Ok(hit);
     }
 
-    let order = if ctx.cfg.fallback && !ctx.cli.no_fallback {
-        engines::fallback_order(name)
+    let order = if (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback {
+        engines::fallback_order(requested)
     } else {
-        vec![engines::canonical_engine(name).unwrap_or("duckduckgo")]
+        vec![requested]
     };
 
     let (results, engine_used) = try_engines(&|m| ctx.trace(m), &order, |eng_name| {
@@ -405,18 +502,18 @@ fn images_with_cache(
     count: usize,
     safe: bool,
 ) -> Result<(Vec<models::ImageResult>, &'static str)> {
-    image_engine_by_name(name)?;
+    let requested = image_engine_by_name(name)?.name();
 
-    let key = cache::images_key(name, query, count, safe);
+    let key = cache::images_key(requested, query, count, safe);
     if let Some(hit) = cached::<models::ImageResult>(ctx, &key) {
         ctx.trace(&format!("{} image results (cache hit)", hit.1));
         return Ok(hit);
     }
 
-    let order = if ctx.cfg.fallback && !ctx.cli.no_fallback {
-        engines::image_fallback_order(name)
+    let order = if (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback {
+        engines::image_fallback_order(requested)
     } else {
-        vec![engines::canonical_image_engine(name).unwrap_or("bing")]
+        vec![requested]
     };
 
     let opts = ctx.image_opts(count, safe);
@@ -435,8 +532,16 @@ fn cached<T: for<'de> Deserialize<'de>>(
     ctx: &Ctx<'_>,
     key: &str,
 ) -> Option<(Vec<T>, &'static str)> {
-    let value = ctx.cache.lock().ok().and_then(|c| c.get(key))?;
-    let hit: CachedSearch<T> = serde_json::from_value(value).ok()?;
+    let value = ctx.cache.lock().ok().and_then(|mut c| c.get(key))?;
+    let hit: CachedSearch<T> = match serde_json::from_value(value) {
+        Ok(hit) => hit,
+        Err(_) => {
+            if let Ok(mut cache) = ctx.cache.lock() {
+                cache.remove(key);
+            }
+            return None;
+        }
+    };
     let engine = engines::canonical_engine(&hit.engine)
         .or_else(|| engines::canonical_image_engine(&hit.engine))?;
     Some((hit.results, engine))

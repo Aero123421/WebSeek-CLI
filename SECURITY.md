@@ -35,6 +35,10 @@ bodies are untrusted input**. Bugs in that direction are in scope:
 - Path traversal or unexpected writes via `images --download` filenames.
 - Anything that causes webseek to send credentials, local file contents, or
   environment data to a remote host.
+- Egress-policy bypasses that reach loopback, private, link-local or reserved
+  destinations without the explicit `--allow-private` opt-out.
+- Terminal-control injection through pretty output, and unsafe overwrite or
+  symlink-following behavior in image downloads.
 
 Also in scope: flaws in the release pipeline or the install scripts.
 
@@ -43,11 +47,21 @@ Also in scope: flaws in the release pipeline or the install scripts.
 These are documented behaviours. Please don't file them as vulnerabilities —
 but do file an issue if you think the trade-off is wrong.
 
-- **webseek fetches whatever URL it is given.** There is no allow-list and no
-  filtering of private address ranges, so `webseek fetch
-  http://169.254.169.254/…` will reach a cloud metadata endpoint just as
-  `curl` would. If you point webseek at URLs from an untrusted source inside a
-  privileged network, apply egress controls at the network layer.
+- **Private-network access is an explicit opt-out.** By default webseek allows
+  only HTTP(S), rejects URL credentials, and blocks loopback, private,
+  link-local, multicast and reserved addresses on initial URLs, DNS answers
+  and redirects. `--allow-private` / `allow_private_network = true` disables
+  the address-range restriction for deliberate internal use.
+- **Proxies move DNS enforcement outside the process.** A configured HTTP(S)
+  proxy resolves the destination itself, so webseek cannot inspect that final
+  IP. A warning is emitted when strict egress policy and a proxy environment
+  variable are both active. Use `--no-proxy` / `allow_proxy = false` when the
+  strongest local egress guarantee is required, and enforce policy at the
+  proxy/network layer otherwise.
+- **Opening a URL is not fetching it.** `--open` blocks non-HTTP schemes by
+  default but permits private HTTP(S) destinations because the user's browser,
+  not webseek, performs that request. Use `--allow-external-schemes` only when
+  deliberately launching schemes such as `mailto:`.
 - **robots.txt is advisory and opt-in.** With `--respect-robots`, only the `*`
   user-agent group is consulted, and an unreachable robots.txt is treated as
   "allowed".

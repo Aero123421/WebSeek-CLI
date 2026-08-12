@@ -20,6 +20,7 @@ use serde::ser::SerializeStruct;
 use crate::cache::Cache;
 use crate::error::Error;
 use crate::models::{FetchOpts, FetchResult};
+use crate::net::EgressPolicy;
 use crate::pace::Pacer;
 use crate::robots::RobotsChecker;
 
@@ -82,6 +83,7 @@ pub struct BatchCtx<'a> {
     pub robots: &'a Arc<Mutex<RobotsChecker>>,
     pub pacer: &'a Arc<Pacer>,
     pub respect_robots: bool,
+    pub policy: EgressPolicy,
 }
 
 /// Fetch `urls` (in order) using up to `jobs` workers.
@@ -146,6 +148,10 @@ fn fetch_one_isolated(ctx: &BatchCtx<'_>, url: &str) -> BatchItem {
 /// mode it is a command failure.
 /// Returns the page and whether it came from the cache (for `--verbose`).
 pub fn fetch_one(ctx: &BatchCtx<'_>, url: &str) -> crate::error::Result<(FetchResult, bool)> {
+    // A strict invocation must never serve a cached response for a destination
+    // it would now refuse to contact.
+    crate::net::parse_checked(url, ctx.policy)?;
+
     // robots.txt is consulted before the cache: a cached copy is not
     // permission to have fetched it, and the two paths must agree on order.
     if ctx.respect_robots {
@@ -159,16 +165,18 @@ pub fn fetch_one(ctx: &BatchCtx<'_>, url: &str) -> crate::error::Result<(FetchRe
     }
 
     let key = crate::cache::fetch_key(url, ctx.opts);
-    if let Some(v) = ctx.cache.lock().ok().and_then(|c| c.get(&key)) {
+    if let Some(v) = ctx.cache.lock().ok().and_then(|mut c| c.get(&key)) {
         if let Ok(f) = serde_json::from_value::<FetchResult>(v) {
             return Ok((f, true));
         }
         // A malformed entry is a cache bug, not a page error: fall through and
         // fetch it for real rather than reporting a failure to the caller.
+        if let Ok(mut cache) = ctx.cache.lock() {
+            cache.remove(&key);
+        }
     }
 
-    ctx.pacer.wait();
-    let fetched = crate::reader::fetch(ctx.client, url, ctx.opts)?;
+    let fetched = crate::reader::fetch_paced(ctx.client, url, ctx.opts, ctx.policy, ctx.pacer)?;
     if let Ok(mut c) = ctx.cache.lock() {
         if let Ok(value) = serde_json::to_value(&fetched) {
             c.put(key, value);

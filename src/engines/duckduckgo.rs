@@ -63,7 +63,7 @@ impl SearchEngine for DuckDuckGo {
         if !status.is_success() {
             return Err(Error::Http(status.as_u16()));
         }
-        let body = resp.text().map_err(Error::from)?;
+        let body = crate::http::response_text(resp)?;
         // A 200 that is really an interstitial must be an error, not an empty
         // result set, or fallback never triggers.
         if crate::engines::looks_like_challenge(&body) {

@@ -14,7 +14,9 @@ fn main() -> ExitCode {
         Err(e) => {
             // `{:#}` prints the message chain via Display — no Debug dump and
             // no backtrace in the user's face.
-            eprintln!("webseek: error: {e:#}");
+            let rendered = format!("{e:#}");
+            let message = webseek::text::sanitize_line(&rendered);
+            eprintln!("webseek: error: {message}");
             ExitCode::from(1)
         }
     }

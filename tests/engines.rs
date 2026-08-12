@@ -214,9 +214,14 @@ fn browser_headers_reach_the_server() {
             .mount(&server)
             .await;
     });
-    let client =
-        webseek::http::build_client(std::time::Duration::from_secs(10), "webseek-header-test")
-            .unwrap();
+    let client = webseek::http::build_client(
+        std::time::Duration::from_secs(10),
+        "webseek-header-test",
+        "en-US,en;q=0.9",
+        webseek::net::EgressPolicy::permissive(),
+        false,
+    )
+    .unwrap();
     let engine = DuckDuckGo::with_base(format!("{}/html/", server.uri()));
     assert_eq!(engine.search(&client, "rust", &opts()).unwrap().len(), 2);
 
@@ -275,6 +280,9 @@ fn api_engines_identify_themselves_rather_than_impersonating_a_browser() {
     let browser = webseek::http::build_client(
         std::time::Duration::from_secs(10),
         webseek::config::DEFAULT_USER_AGENT,
+        "en-US,en;q=0.9",
+        webseek::net::EgressPolicy::permissive(),
+        false,
     )
     .unwrap();
     assert_eq!(engine.search(&browser, "rust", &opts).unwrap().len(), 1);
@@ -392,7 +400,14 @@ fn search_recovers_after_transient_500_via_retry() {
     let base = format!("{}/html/", server.uri());
 
     let engine = DuckDuckGo::with_base(base);
-    let results = engine.search(&client(), "rust", &opts()).unwrap();
+    let paced = SearchOpts {
+        pacer: std::sync::Arc::new(webseek::pace::Pacer::new(std::time::Duration::from_millis(
+            600,
+        ))),
+        ..opts()
+    };
+    let started = std::time::Instant::now();
+    let results = engine.search(&client(), "rust", &paced).unwrap();
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].url, "https://example.com/1");
@@ -400,5 +415,9 @@ fn search_recovers_after_transient_500_via_retry() {
         rt.block_on(server.received_requests()).unwrap().len(),
         2,
         "the retry path was never exercised"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(550),
+        "a retry bypassed the shared request pacer"
     );
 }

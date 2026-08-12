@@ -12,7 +12,7 @@ body:
     attributes:
       label: webseek version
       description: Output of `webseek --version`.
-      placeholder: webseek 0.2.0
+      placeholder: webseek 0.3.0
     validations:
       required: true
   - type: dropdown

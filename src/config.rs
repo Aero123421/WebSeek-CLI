@@ -14,6 +14,7 @@
 //!
 //! Run `webseek init` to write a documented default file.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -80,12 +81,22 @@ pub struct TomlConfig {
     pub cache_ttl_secs: u64,
     /// Max cached responses (0 disables the cache entirely).
     pub cache_max_entries: usize,
+    /// Max total serialized cache size in bytes (0 disables the byte budget).
+    pub cache_max_bytes: u64,
     /// Fall back to another *web* engine when the primary fails or is blocked.
     pub fallback: bool,
     /// Honor robots.txt before fetching pages.
     pub respect_robots: bool,
     /// Skip downloaded images larger than this many bytes.
     pub image_max_bytes: usize,
+    /// Replace an existing generated image file. Disabled by default so a
+    /// predictable filename cannot overwrite user data or follow a symlink.
+    pub image_overwrite: bool,
+    /// Allow loopback/private/link-local/reserved network destinations.
+    pub allow_private_network: bool,
+    /// Allow reqwest to honor configured HTTP(S) proxy environment variables.
+    /// A proxy resolves destinations outside webseek's DNS egress guard.
+    pub allow_proxy: bool,
 }
 
 impl Default for TomlConfig {
@@ -104,9 +115,13 @@ impl Default for TomlConfig {
             max_results: 5,
             cache_ttl_secs: 3600,
             cache_max_entries: 1000,
+            cache_max_bytes: crate::cache::DEFAULT_MAX_BYTES,
             fallback: true,
             respect_robots: false,
             image_max_bytes: crate::engines::images::DEFAULT_MAX_IMAGE_BYTES,
+            image_overwrite: false,
+            allow_private_network: false,
+            allow_proxy: true,
         }
     }
 }
@@ -127,9 +142,13 @@ pub struct Config {
     pub max_results: usize,
     pub cache_ttl_secs: u64,
     pub cache_max_entries: usize,
+    pub cache_max_bytes: u64,
     pub fallback: bool,
     pub respect_robots: bool,
     pub image_max_bytes: usize,
+    pub image_overwrite: bool,
+    pub allow_private_network: bool,
+    pub allow_proxy: bool,
 }
 
 impl Default for Config {
@@ -171,9 +190,13 @@ impl Config {
             max_results: t.max_results.clamp(1, crate::cli::MAX_RESULTS),
             cache_ttl_secs: t.cache_ttl_secs,
             cache_max_entries: t.cache_max_entries,
+            cache_max_bytes: t.cache_max_bytes,
             fallback: t.fallback,
             respect_robots: t.respect_robots,
             image_max_bytes: t.image_max_bytes.max(1024),
+            image_overwrite: t.image_overwrite,
+            allow_private_network: t.allow_private_network,
+            allow_proxy: t.allow_proxy,
         }
     }
 
@@ -209,9 +232,33 @@ impl Config {
             toml::to_string_pretty(&TomlConfig::default())
                 .map_err(|e| Error::Config(e.to_string()))?
         );
-        std::fs::write(&path, doc)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Config(format!(
+                    "refusing to overwrite existing config: {}",
+                    path.display()
+                ))
+            } else {
+                Error::Config(format!("cannot create {}: {e}", path.display()))
+            }
+        })?;
+        file.write_all(doc.as_bytes())
             .map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))?;
         Ok(path)
+    }
+
+    /// Path that would be read or written for the current CLI/environment.
+    pub fn effective_path(path: Option<&Path>) -> PathBuf {
+        match resolve_path(path) {
+            Source::Explicit(path) | Source::Default(path) => path,
+        }
     }
 }
 
@@ -316,6 +363,14 @@ mod tests {
         assert_eq!(api_user_agent_with_contact(None), api_user_agent());
         assert_eq!(api_user_agent_with_contact(Some("  ")), api_user_agent());
         assert!(api_user_agent_with_contact(Some("me@example.com")).ends_with("me@example.com"));
+    }
+
+    #[test]
+    fn security_sensitive_defaults_are_closed() {
+        let cfg = TomlConfig::default();
+        assert!(!cfg.allow_private_network);
+        assert!(!cfg.image_overwrite);
+        assert!(cfg.allow_proxy);
     }
 
     #[test]
