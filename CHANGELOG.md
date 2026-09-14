@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses that engine.
 - CLI tests cover default egress blocking of loopback and `--fail-if-all-error`
   when every URL fails.
+- Bump transitive `h2` to 0.4.19 (`RUSTSEC-2026-0258`, unbounded empty DATA
+  frames).
 
 ## [0.3.0] - 2026-08-12
 
