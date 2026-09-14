@@ -91,16 +91,11 @@ impl ImageEngine for BingImages {
         let resp = opts
             .send(client.get(url))
             .map_err(|e| Error::Network(format!("bing images request failed: {e}")))?;
-        let status = resp.status();
-        if matches!(status.as_u16(), 202 | 403 | 429) {
-            return Err(Error::RateLimited(format!(
-                "bing images answered HTTP {status} (retry later or lower request rate)"
-            )));
-        }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
-        }
+        crate::http::scrape_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
+        if crate::reader::max_nesting_depth(&body) > crate::reader::MAX_NESTING_DEPTH {
+            return Err(Error::Parse("document nesting too deep".into()));
+        }
         // Without this the text engine reported challenges but the image
         // engine silently returned zero results, so fallback never fired.
         if crate::engines::looks_like_challenge(&body) {
@@ -127,7 +122,7 @@ impl ImageEngine for DuckDuckGoImages {
         let vqd = fetch_vqd(client, query, opts, &self.page_base)?;
         let mut params = vec![("q", query), ("o", "json"), ("vqd", vqd.as_str())];
         if opts.safe {
-            params.push(("kp", "1"));
+            params.push(("p", "1"));
         }
         let url = Url::parse_with_params(&self.json_base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
@@ -135,15 +130,7 @@ impl ImageEngine for DuckDuckGoImages {
         let resp = opts
             .send(client.get(url))
             .map_err(|e| Error::Network(format!("duckduckgo images request failed: {e}")))?;
-        let status = resp.status();
-        if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-            return Err(Error::RateLimited(format!(
-                "duckduckgo answered HTTP {status} (retry later or lower request rate)"
-            )));
-        }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
-        }
+        crate::http::scrape_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
         Ok(dedupe_and_truncate(
             parse_ddg_json(&body)?,
@@ -164,16 +151,13 @@ fn fetch_vqd(client: &Client, query: &str, opts: &ImageOpts, page_base: &str) ->
     let resp = opts
         .send(client.get(url))
         .map_err(|e| Error::Network(format!("duckduckgo vqd request failed: {e}")))?;
-    let status = resp.status();
-    if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-        return Err(Error::RateLimited(format!(
-            "duckduckgo answered HTTP {status} while fetching vqd token"
-        )));
-    }
-    if !status.is_success() {
-        return Err(Error::Http(status.as_u16()));
-    }
+    crate::http::scrape_status(resp.status().as_u16())?;
     let body = crate::http::response_text(resp)?;
+    if crate::engines::looks_like_challenge(&body) {
+        return Err(Error::RateLimited(
+            "duckduckgo served a bot-challenge page instead of an image token".into(),
+        ));
+    }
     extract_vqd(&body).ok_or_else(|| {
         Error::Parse(
             "could not locate vqd token in duckduckgo image page (page layout changed?)".into(),
@@ -332,12 +316,8 @@ pub fn download(ctx: &DownloadCtx<'_>, results: &[ImageResult], dir: &Path) -> R
     let mut saved = Vec::new();
     for (i, img) in results.iter().take(ctx.limit).enumerate() {
         if let Some(robots) = ctx.robots {
-            let allowed = match robots.lock() {
-                Ok(mut c) => c
-                    .is_allowed(ctx.client, ctx.pacer, &img.url)
-                    .unwrap_or(true),
-                Err(_) => true,
-            };
+            let allowed = crate::robots::check_allowed(robots, ctx.client, ctx.pacer, &img.url)
+                .unwrap_or(true);
             if !allowed {
                 crate::output::warn(&format!("skipping {} (robots.txt)", img.url));
                 continue;
@@ -458,25 +438,37 @@ fn write_image_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
         return Ok(());
     }
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".webseek-image-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| Error::Network(format!("cannot stage {}: {e}", path.display())))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
     }
-    let mut file = options.open(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
+    tmp.write_all(bytes)
+        .map_err(|e| Error::Network(format!("cannot write {}: {e}", path.display())))?;
+    tmp.flush()
+        .map_err(|e| Error::Network(format!("cannot flush {}: {e}", path.display())))?;
+    tmp.persist_noclobber(path).map_err(|e| {
+        if e.error.kind() == std::io::ErrorKind::AlreadyExists {
             Error::Config(format!(
                 "{} already exists (use --overwrite to replace it)",
                 path.display()
             ))
         } else {
-            Error::Network(format!("cannot write {}: {e}", path.display()))
+            Error::Network(format!("cannot write {}: {}", path.display(), e.error))
         }
     })?;
-    file.write_all(bytes)
-        .map_err(|e| Error::Network(format!("cannot write {}: {e}", path.display())))
+    Ok(())
 }
 
 /// Map an image MIME type to a conventional extension.

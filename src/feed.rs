@@ -90,12 +90,15 @@ pub fn parse_entries(body: &str) -> Result<Vec<FeedEntry>> {
                                 if current.link.is_empty() {
                                     current.link = href;
                                 }
-                            } else {
+                            } else if attr(&e, "href").is_none() {
+                                // RSS puts the URL in text. An Atom
+                                // `<link rel="self" href=...>` has an href
+                                // but is not the entry target — ignore it.
                                 field = Some((Field::Link, depth));
                                 buf.clear();
                             }
                         } else if f == Field::Category {
-                            if let Some(label) = attr(&e, "label") {
+                            if let Some(label) = attr(&e, "label").or_else(|| attr(&e, "term")) {
                                 if current.category.is_empty() {
                                     current.category = label;
                                 }
@@ -122,11 +125,9 @@ pub fn parse_entries(body: &str) -> Result<Vec<FeedEntry>> {
                                 }
                             }
                         }
-                        "category" => {
-                            if let Some(label) = attr(&e, "label") {
-                                if current.category.is_empty() {
-                                    current.category = label;
-                                }
+                        "category" if current.category.is_empty() => {
+                            if let Some(label) = attr(&e, "label").or_else(|| attr(&e, "term")) {
+                                current.category = label;
                             }
                         }
                         _ => {}
@@ -211,27 +212,31 @@ fn commit(entry: &mut FeedEntry, field: Field, value: String) {
     // First non-empty value wins; `summary` set earlier is not clobbered by a
     // later `content` (and vice versa).
     if slot.trim().is_empty() {
-        *slot = value;
+        *slot = value.trim().to_string();
     }
 }
 
 fn field_for(name: &str, parents: &[String]) -> Option<Field> {
+    let parent = parents.last().map(String::as_str);
+    let in_item = matches!(parent, Some("item") | Some("entry"));
     match name {
-        "title" => Some(Field::Title),
-        "link" => Some(Field::Link),
-        "description" | "summary" => Some(Field::Summary),
-        "content" | "encoded" => Some(Field::Content),
-        "category" => Some(Field::Category),
+        "title" | "link" | "description" | "summary" | "content" | "encoded" | "category"
+            if in_item =>
+        {
+            Some(match name {
+                "title" => Field::Title,
+                "link" => Field::Link,
+                "description" | "summary" => Field::Summary,
+                "content" | "encoded" => Field::Content,
+                "category" => Field::Category,
+                _ => unreachable!(),
+            })
+        }
         // RSS's `<dc:creator>Name</dc:creator>` is a leaf, unambiguous.
-        "creator" => Some(Field::Author),
-        // Deliberately *not* `"author" => Some(Field::Author)`: Atom's
-        // `<author>` is a container with a `<name>` child *and* other
-        // siblings like `<uri>`/`<email>`. Treating the container itself as
-        // the field start would buffer every descendant's text — including
-        // `<uri>`'s — into one blob (`"/u/alicehttps://.../u/alice"` instead
-        // of just `"/u/alice"`). Only the `<name>` child is mapped, and only
-        // when its parent is `<author>`, so unmapped siblings are ignored.
-        "name" if parents.last().map(|p| p == "author").unwrap_or(false) => Some(Field::Author),
+        "creator" if in_item => Some(Field::Author),
+        "author" if parent == Some("item") => Some(Field::Author),
+        // Atom `<author><name>` — only the name child, only under author.
+        "name" if parent == Some("author") => Some(Field::Author),
         _ => None,
     }
 }

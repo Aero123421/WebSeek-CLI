@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::{join_meta, normalize_snippet, strip_html};
@@ -41,7 +41,6 @@ impl OpenAlex {
 
 #[derive(Deserialize)]
 struct OaResp {
-    #[serde(default)]
     results: Vec<OaWork>,
 }
 #[derive(Deserialize)]
@@ -91,11 +90,13 @@ impl SearchEngine for OpenAlex {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("openalex request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        openalex_parse(&body)
+        Ok(dedupe_and_truncate(
+            openalex_parse(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -208,11 +209,13 @@ impl SearchEngine for CrossRef {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("crossref request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        crossref_parse(&body)
+        Ok(dedupe_and_truncate(
+            crossref_parse(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -293,6 +296,8 @@ struct ESearchResp {
 struct IdList {
     #[serde(default)]
     idlist: Vec<String>,
+    #[serde(default, rename = "ERROR")]
+    error: Option<String>,
 }
 #[derive(Deserialize)]
 struct ESumResp {
@@ -319,11 +324,13 @@ impl SearchEngine for PubMed {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esummary failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        pubmed_parse(&body, &ids)
+        Ok(dedupe_and_truncate(
+            pubmed_parse(&body, &ids)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -357,16 +364,17 @@ impl PubMed {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("pubmed esearch failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
         let parsed = serde_json::from_str::<ESearchResp>(&body)
             .map_err(|e| Error::Parse(format!("pubmed esearch response is not valid JSON: {e}")))?;
-        parsed
+        let list = parsed
             .esearchresult
-            .map(|r| r.idlist)
-            .ok_or_else(|| Error::Parse("pubmed esearch response omitted esearchresult".into()))
+            .ok_or_else(|| Error::Parse("pubmed esearch response omitted esearchresult".into()))?;
+        if let Some(err) = list.error.filter(|e| !e.is_empty()) {
+            return Err(Error::Parse(format!("pubmed esearch error: {err}")));
+        }
+        Ok(list.idlist)
     }
 }
 
@@ -377,7 +385,7 @@ pub fn pubmed_parse(body: &str, ids: &[String]) -> Result<Vec<SearchResult>> {
     let result = resp
         .result
         .ok_or_else(|| Error::Parse("pubmed esummary response omitted result".into()))?;
-    Ok(ids
+    let out: Vec<SearchResult> = ids
         .iter()
         .filter_map(|uid| {
             let doc = result.get(uid)?;
@@ -396,7 +404,13 @@ pub fn pubmed_parse(body: &str, ids: &[String]) -> Result<Vec<SearchResult>> {
                 snippet: normalize_snippet(&join_meta(&[source, pubdate])),
             })
         })
-        .collect())
+        .collect();
+    if out.is_empty() && !ids.is_empty() {
+        return Err(Error::Parse(
+            "pubmed esummary returned no documents for the requested ids".into(),
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

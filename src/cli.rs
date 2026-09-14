@@ -25,6 +25,22 @@ fn jobs_parser() -> RangedU64ValueParser<usize> {
     RangedU64ValueParser::<usize>::new().range(1..=MAX_JOBS as u64)
 }
 
+fn timeout_parser() -> RangedU64ValueParser<u64> {
+    RangedU64ValueParser::<u64>::new().range(1..=600)
+}
+
+fn max_chars_parser() -> RangedU64ValueParser<usize> {
+    RangedU64ValueParser::<usize>::new().range(1..=10_000_000)
+}
+
+fn open_parser() -> RangedU64ValueParser<usize> {
+    RangedU64ValueParser::<usize>::new().range(1..=MAX_RESULTS as u64)
+}
+
+fn max_bytes_parser() -> RangedU64ValueParser<usize> {
+    RangedU64ValueParser::<usize>::new().range(1024..=100_000_000)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "webseek",
@@ -78,8 +94,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub delay: Option<u64>,
 
-    /// Per-request timeout in seconds.
-    #[arg(long, global = true)]
+    /// Per-request timeout in seconds (1..=600).
+    #[arg(long, global = true, value_parser = timeout_parser())]
     pub timeout: Option<u64>,
 
     /// Disable the on-disk response cache.
@@ -180,7 +196,7 @@ pub enum Command {
         no_safe: bool,
 
         /// Open the Nth result (1-based) in the default browser.
-        #[arg(long)]
+        #[arg(long, value_parser = open_parser())]
         open: Option<usize>,
     },
 
@@ -194,7 +210,7 @@ pub enum Command {
         urls: Vec<String>,
 
         /// Character cap on output. Default: config `max_chars`, else 20000.
-        #[arg(long)]
+        #[arg(long, value_parser = max_chars_parser())]
         max_chars: Option<usize>,
 
         /// Keep light markdown (headings, lists, links).
@@ -248,11 +264,11 @@ pub enum Command {
         download: Option<PathBuf>,
 
         /// Max number of files to download (default: all results).
-        #[arg(long)]
+        #[arg(long, value_parser = count_parser())]
         limit: Option<usize>,
 
         /// Skip files larger than this many bytes when downloading.
-        #[arg(long)]
+        #[arg(long, value_parser = max_bytes_parser())]
         max_bytes: Option<usize>,
 
         /// Enable safe search.

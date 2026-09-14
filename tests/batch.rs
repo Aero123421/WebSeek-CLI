@@ -391,5 +391,7 @@ fn duplicate_urls_in_one_batch_reuse_the_cache() {
     let items = fetch_many(&h.ctx(false), &[url.clone(), url], 1);
     assert_eq!(items.len(), 2);
     assert_eq!(unwrap_ok(&items[0]).text, unwrap_ok(&items[1]).text);
+    let received = rt.block_on(server.received_requests()).unwrap();
+    assert_eq!(received.len(), 1, "second URL must be a cache hit");
     let _ = std::fs::remove_dir_all(&dir);
 }

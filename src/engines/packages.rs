@@ -9,7 +9,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::{join_meta, normalize_snippet};
@@ -40,7 +40,6 @@ impl Crates {
 
 #[derive(Deserialize)]
 struct CratesResp {
-    #[serde(default)]
     crates: Vec<Crate>,
 }
 #[derive(Deserialize)]
@@ -72,11 +71,11 @@ impl SearchEngine for Crates {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("crates.io request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        crates_parse(&body)
+        Ok(dedupe_and_truncate(crates_parse(&body)?, opts.count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -132,7 +131,6 @@ impl Npm {
 
 #[derive(Deserialize)]
 struct NpmResp {
-    #[serde(default)]
     objects: Vec<NpmObj>,
 }
 #[derive(Deserialize)]
@@ -176,11 +174,11 @@ impl SearchEngine for Npm {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("npm request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        npm_parse(&body)
+        Ok(dedupe_and_truncate(npm_parse(&body)?, opts.count, |r| {
+            &r.url
+        }))
     }
 }
 
@@ -264,6 +262,9 @@ impl SearchEngine for PyPi {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let name = query.trim();
+        if name.is_empty() || name == "." || name == ".." {
+            return Ok(Vec::new());
+        }
         // Encode the package name as one path segment. Interpolating it raw
         // let `../` in a query walk to unrelated paths on pypi.org.
         let url = Url::parse(&format!(
@@ -280,9 +281,7 @@ impl SearchEngine for PyPi {
             // Unknown package name -> simply no results, not an error.
             return Ok(Vec::new());
         }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
-        }
+        crate::http::api_status(status.as_u16())?;
         let body = crate::http::response_text(resp)?;
         pypi_parse(&body, name)
     }
@@ -298,7 +297,12 @@ pub fn pypi_parse(body: &str, name: &str) -> Result<Vec<SearchResult>> {
         .package_url
         .filter(|s| !s.is_empty())
         .or(info.home_page)
-        .unwrap_or_else(|| format!("https://pypi.org/project/{name}/"));
+        .unwrap_or_else(|| {
+            format!(
+                "https://pypi.org/project/{}/",
+                crate::text::encode_path_segment(name)
+            )
+        });
     let title = if info.name.is_empty() {
         name.to_string()
     } else {

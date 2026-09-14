@@ -51,8 +51,10 @@ impl SearchEngine for Bing {
 
         // Preferred path: the RSS endpoint. It is a stable, structured format
         // and — unlike the HTML page — is not behind a bot challenge.
-        if let Some(results) = self.search_rss(client, query, &lang, cc.as_deref(), opts) {
-            return Ok(results);
+        match self.search_rss(client, query, &lang, cc.as_deref(), opts) {
+            Ok(Some(results)) => return Ok(results),
+            Ok(None) => {}
+            Err(e) => return Err(e),
         }
 
         // Fallback: scrape the HTML result page.
@@ -72,18 +74,11 @@ impl SearchEngine for Bing {
         let resp = opts
             .send(client.get(url))
             .map_err(|e| Error::Network(format!("bing request failed: {e}")))?;
-        let status = resp.status();
-        // Classify refusals the same way DuckDuckGo does, so `--verbose` and
-        // the error taxonomy don't depend on which engine answered.
-        if matches!(status.as_u16(), 202 | 403 | 429) {
-            return Err(Error::RateLimited(format!(
-                "bing answered HTTP {status} (retry later or lower request rate)"
-            )));
-        }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
-        }
+        crate::http::scrape_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
+        if crate::reader::max_nesting_depth(&body) > crate::reader::MAX_NESTING_DEPTH {
+            return Err(Error::Parse("document nesting too deep".into()));
+        }
         if crate::engines::looks_like_challenge(&body) {
             return Err(Error::RateLimited(
                 "bing served a bot-challenge page instead of results (IP reputation)".into(),
@@ -96,7 +91,9 @@ impl SearchEngine for Bing {
 }
 
 impl Bing {
-    /// Try the RSS endpoint; `None` means "RSS unusable, fall back to HTML".
+    /// Try the RSS endpoint. `Ok(None)` means "200 but unusable, try HTML".
+    /// Transport / 429 / 403 errors propagate so they are not hidden behind
+    /// an empty HTML parse.
     fn search_rss(
         &self,
         client: &Client,
@@ -104,7 +101,7 @@ impl Bing {
         lang: &Option<String>,
         cc: Option<&str>,
         opts: &SearchOpts,
-    ) -> Option<Vec<SearchResult>> {
+    ) -> Result<Option<Vec<SearchResult>>> {
         let mut params: Vec<(&str, &str)> = vec![("q", query), ("format", "rss")];
         if let Some(lang) = lang {
             params.push(("setlang", lang.as_str()));
@@ -115,17 +112,24 @@ impl Bing {
         if opts.safe {
             params.push(("adlt", "strict"));
         }
-        let url = Url::parse_with_params(&self.base, &params).ok()?;
-        let resp = opts.send(client.get(url)).ok()?;
+        let url = Url::parse_with_params(&self.base, &params)
+            .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
+        let resp = opts.send(client.get(url))?;
+        let status = resp.status().as_u16();
+        if matches!(status, 202 | 403 | 429) {
+            return Err(Error::RateLimited(format!(
+                "bing answered HTTP {status} (retry later or lower request rate)"
+            )));
+        }
         if !resp.status().is_success() {
-            return None;
+            return Err(Error::Http(status));
         }
-        let body = crate::http::response_text(resp).ok()?;
-        let results = parse_rss(&body).ok()?;
-        if results.is_empty() {
-            return None;
-        }
-        Some(dedupe_and_truncate(results, opts.count, |r| &r.url))
+        let body = crate::http::response_text(resp)?;
+        let results = match parse_rss(&body) {
+            Ok(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+        Ok(Some(dedupe_and_truncate(results, opts.count, |r| &r.url)))
     }
 }
 
@@ -180,11 +184,13 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
 pub fn parse_rss(body: &str) -> Result<Vec<SearchResult>> {
     Ok(feed::parse_entries(body)?
         .into_iter()
-        .filter(|entry| !entry.link.is_empty())
-        .map(|entry| SearchResult {
-            title: normalize_snippet(&entry.title),
-            url: entry.link,
-            snippet: normalize_snippet(&crate::text::strip_html(&entry.summary)),
+        .filter_map(|entry| {
+            let url = crate::text::http_url(&entry.link)?;
+            Some(SearchResult {
+                title: normalize_snippet(&entry.title),
+                url,
+                snippet: normalize_snippet(&crate::text::strip_html(&entry.summary)),
+            })
         })
         .collect())
 }
@@ -255,7 +261,7 @@ mod tests {
 
     const FIXTURE: &str = r#"<html><body><ol id="b_results">
       <li class="b_algo">
-        <h2><a href="https://www.bing.com/ck/a?u=aHR0cHM6Ly9leGFtcGxlLmNvbS9ydXN0&ntb=1">Rust async runtime</a></h2>
+        <h2><a href="https://www.bing.com/ck/a?!&&p=1&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9ydXN0&ntb=1">Rust async runtime</a></h2>
         <div class="b_caption"><p>Tokio is the <strong>most used</strong> async runtime.</p></div>
       </li>
       <li class="b_algo">

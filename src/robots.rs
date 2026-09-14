@@ -120,6 +120,7 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// `User-agent: *` followed by `User-agent: googlebot` applies to both — the
 /// rules that follow still bind us.
 pub fn parse_robots(body: &str) -> RobotsRules {
+    let body = body.trim_start_matches('\u{feff}');
     let mut rules = RobotsRules::default();
     // Are we inside a group whose agent list includes `*`?
     let mut group_matches = false;
@@ -164,7 +165,7 @@ pub fn parse_robots(body: &str) -> RobotsRules {
                     continue;
                 }
                 rules.rules.push(Rule {
-                    pattern: value.to_string(),
+                    pattern: encode_robots_bytes(value),
                     allow: key == "allow",
                 });
             }
@@ -176,6 +177,35 @@ pub fn parse_robots(body: &str) -> RobotsRules {
         }
     }
     rules
+}
+
+/// Percent-encode non-ASCII octets and uppercase existing `%xx` so patterns
+/// match `Url::path()` (RFC 9309 §2.2.2).
+fn encode_robots_bytes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push((bytes[i + 1] as char).to_ascii_uppercase());
+            out.push((bytes[i + 2] as char).to_ascii_uppercase());
+            i += 3;
+            continue;
+        }
+        if bytes[i] >= 0x80 {
+            out.push_str(&format!("%{:02X}", bytes[i]));
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Per-origin cache shared across a run (fetch may hit many URLs).
@@ -200,49 +230,77 @@ impl RobotsChecker {
     /// Returns `Ok(true)` when the URL may be fetched. `Ok(true)` on any lookup
     /// failure (missing robots.txt, network error) — robots is advisory.
     pub fn is_allowed(&mut self, client: &Client, pacer: &Pacer, url: &str) -> Result<bool> {
-        let parsed = net::parse_checked(url, self.policy)?;
+        let (origin, path) = Self::origin_and_path(url, self.policy)?;
+        if let Some(entry) = self.cache.get(&origin) {
+            return Ok(entry.as_ref().map(|r| r.is_allowed(&path)).unwrap_or(true));
+        }
+        let fetched = fetch_rules(client, pacer, self.policy, &origin);
+        self.cache.insert(origin, fetched.clone());
+        Ok(fetched.map(|r| r.is_allowed(&path)).unwrap_or(true))
+    }
+
+    fn origin_and_path(url: &str, policy: EgressPolicy) -> Result<(String, String)> {
+        let parsed = net::parse_checked(url, policy)?;
         let host = parsed.host_str().unwrap_or("");
-        // Preserve an explicit port so origins like `http://127.0.0.1:8080`
-        // resolve their robots.txt on the right endpoint.
         let origin = match parsed.port() {
             Some(p) => format!("{}://{}:{}", parsed.scheme(), host, p),
             None => format!("{}://{}", parsed.scheme(), host),
         };
-
-        // RFC 9309 §2.2.2 matches against path *and* query.
         let mut path = parsed.path().to_string();
         if let Some(q) = parsed.query() {
             path.push('?');
             path.push_str(q);
         }
-
-        let rules = match self.cache.get(&origin) {
-            Some(entry) => entry.clone(),
-            None => {
-                let fetched = self.fetch_rules(client, pacer, &origin);
-                self.cache.insert(origin.clone(), fetched.clone());
-                fetched
-            }
-        };
-        Ok(rules.map(|r| r.is_allowed(&path)).unwrap_or(true))
+        Ok((origin, path))
     }
+}
 
-    fn fetch_rules(&self, client: &Client, pacer: &Pacer, origin: &str) -> Option<RobotsRules> {
-        let url = format!("{origin}/robots.txt");
-        let url = net::parse_checked(&url, self.policy).ok()?;
-        let rb = client.get(url).timeout(Duration::from_secs(5));
-        let resp = crate::http::send_with_retry_paced(&rb, pacer).ok()?;
-        if !resp.status().is_success() {
-            return None;
+/// Check robots.txt without holding the checker mutex across the HTTP fetch.
+pub fn check_allowed(
+    lock: &std::sync::Mutex<RobotsChecker>,
+    client: &Client,
+    pacer: &Pacer,
+    url: &str,
+) -> Result<bool> {
+    let (origin, path, policy) = {
+        let c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (origin, path) = RobotsChecker::origin_and_path(url, c.policy)?;
+        if let Some(entry) = c.cache.get(&origin) {
+            return Ok(entry.as_ref().map(|r| r.is_allowed(&path)).unwrap_or(true));
         }
-        // Bounded read: a hostile robots.txt should not be able to exhaust
-        // memory on a request we make automatically.
-        let body = crate::http::read_capped(resp, MAX_ROBOTS_BYTES).ok()?;
-        if body.truncated {
-            return None;
-        }
-        Some(parse_robots(&String::from_utf8_lossy(&body.bytes)))
+        (origin, path, c.policy)
+    };
+    let fetched = fetch_rules(client, pacer, policy, &origin);
+    let mut c = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let rules = c
+        .cache
+        .entry(origin)
+        .or_insert_with(|| fetched.clone())
+        .clone();
+    Ok(rules.map(|r| r.is_allowed(&path)).unwrap_or(true))
+}
+
+fn fetch_rules(
+    client: &Client,
+    pacer: &Pacer,
+    policy: EgressPolicy,
+    origin: &str,
+) -> Option<RobotsRules> {
+    let url = format!("{origin}/robots.txt");
+    let url = net::parse_checked(&url, policy).ok()?;
+    let rb = client.get(url).timeout(Duration::from_secs(5));
+    let resp = crate::http::send_with_retry_paced(&rb, pacer).ok()?;
+    if !resp.status().is_success() {
+        return None;
     }
+    let body = crate::http::read_capped(resp, MAX_ROBOTS_BYTES).ok()?;
+    let mut text = String::from_utf8_lossy(&body.bytes).into_owned();
+    if body.truncated {
+        // Honour the prefix (RFC 9309 / Google): drop only a torn last line.
+        let i = text.rfind('\n')?;
+        text.truncate(i + 1);
+    }
+    Some(parse_robots(&text))
 }
 
 #[cfg(test)]
@@ -268,6 +326,21 @@ mod tests {
         assert!(!rules.is_allowed("/private/secret"));
         assert!(!rules.is_allowed("/tmp/x"));
         assert!(rules.is_allowed("/private/open"));
+    }
+
+    #[test]
+    fn leading_utf8_bom_does_not_drop_the_wildcard_group() {
+        let body = "\u{feff}User-agent: *\nDisallow: /\n";
+        assert!(!parse_robots(body).is_allowed("/x"));
+    }
+
+    #[test]
+    fn non_ascii_patterns_match_percent_encoded_paths() {
+        let rules = parse_robots("User-agent: *\nDisallow: /検索\n");
+        assert!(
+            !rules.is_allowed("/%E6%A4%9C%E7%B4%A2"),
+            "UTF-8 Disallow must match the encoded request path"
+        );
     }
 
     #[test]

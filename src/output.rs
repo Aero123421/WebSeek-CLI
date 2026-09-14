@@ -46,7 +46,8 @@ pub fn set_color(choice: ColorChoice) {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => {
-            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+            std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+                && std::io::stdout().is_terminal()
         }
     };
     COLOR.store(enabled, Ordering::Relaxed);
@@ -294,7 +295,9 @@ pub fn write_fetch_batch_to(
             for item in items {
                 match item {
                     BatchItem::Ok(fetch) => write_fetch_to(w, mode, fetch)?,
-                    BatchItem::Err { url, error, .. } => warn(&format!("{url}: {error}")),
+                    BatchItem::Err { url, error, .. } => {
+                        writeln!(w, "{}: {}", sanitize_line(url), sanitize_line(error))?;
+                    }
                 }
             }
         }

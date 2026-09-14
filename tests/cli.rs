@@ -55,6 +55,20 @@ impl Cli {
         c
     }
 
+    fn cmd_strict(&self) -> Command {
+        let mut c = Command::cargo_bin("webseek").unwrap();
+        c.env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_CACHE_HOME", self.home.path().join("cache"))
+            .env("WEBSEEK_CACHE_DIR", self.home.path().join("webseek-cache"))
+            .env("APPDATA", self.home.path().join("appdata"))
+            .env("LOCALAPPDATA", self.home.path().join("localappdata"))
+            .env_remove("WEBSEEK_CONFIG")
+            .env_remove("NO_COLOR")
+            .env("RUST_BACKTRACE", "0");
+        c
+    }
+
     fn write_config(&self, body: &str) -> std::path::PathBuf {
         let p = self.home.path().join("webseek.toml");
         std::fs::write(&p, body).unwrap();
@@ -287,6 +301,55 @@ fn batch_failures_are_data_while_single_failures_are_errors() {
         ])
         .assert()
         .success();
+
+    let all_fail = cli
+        .cmd()
+        .args([
+            "fetch",
+            &bad,
+            &format!("{}/missing-2", server.uri()),
+            "--json",
+            "--no-cache",
+            "--delay",
+            "0",
+            "--fail-if-all-error",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(all_fail.status.code(), Some(1));
+    assert_eq!(json_of(&all_fail.stdout).as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn private_loopback_is_blocked_by_default() {
+    let out = Cli::new()
+        .cmd_strict()
+        .args([
+            "fetch",
+            "http://127.0.0.1/",
+            "--json",
+            "--no-cache",
+            "--delay",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("blocked") || err.contains("loopback") || err.contains("private"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn open_zero_is_a_usage_error() {
+    let err = Cli::new()
+        .cmd()
+        .args(["search", "rust", "--open", "0", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(err.status.code(), Some(2));
 }
 
 #[test]
@@ -698,15 +761,10 @@ fn quiet_suppresses_notes_without_changing_behaviour() {
 // Pacing
 // ---------------------------------------------------------------------------
 
-/// `search` must pace its upstream requests like every other command.
-///
-/// This is a regression test with history: replacing the old "sleep after the
-/// last request" with a shared pacer wired the pacer into `fetch`, image
-/// downloads and robots.txt — and silently left the entire search path
-/// unpaced, which is *worse* than the bug it replaced. Nothing caught it,
-/// because every other test passes `--delay 0`.
+/// Batch fetch must share one pacer across workers (`-j` does not multiply
+/// the request rate). Search-engine pacing is covered in `tests/engines.rs`.
 #[test]
-fn search_paces_its_upstream_requests() {
+fn fetch_paces_its_upstream_requests() {
     use std::time::Instant;
 
     let rt = runtime();
@@ -788,7 +846,7 @@ fn quiet_does_not_speed_anything_up() {
 
 #[test]
 fn completions_are_generated_for_supported_shells() {
-    for shell in ["bash", "zsh", "fish", "powershell"] {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
         let out = Cli::new()
             .cmd()
             .args(["completions", shell])

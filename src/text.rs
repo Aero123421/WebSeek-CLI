@@ -186,33 +186,74 @@ pub fn join_meta(parts: &[&str]) -> String {
 /// comparisons — `if x < y then` — lost everything up to the next `>`.
 pub fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut ci = 0;
+    while ci < chars.len() {
+        let (idx, c) = chars[ci];
         if c != '<' {
             out.push(c);
+            ci += 1;
             continue;
         }
-        let starts_tag = matches!(
-            chars.peek().map(|(_, c)| *c),
-            Some(c) if c.is_ascii_alphabetic() || c == '/' || c == '!' || c == '?'
-        );
-        if !starts_tag {
+        let rest = &s[idx + 1..];
+        let Some(gt_rel) = rest.find('>') else {
             out.push('<');
+            ci += 1;
+            continue;
+        };
+        let inner = &rest[..gt_rel];
+        if !looks_like_html_tag(inner) {
+            out.push('<');
+            ci += 1;
             continue;
         }
-        // Consume up to and including the closing '>'.
-        let mut closed = false;
-        for (_, c) in chars.by_ref() {
-            if c == '>' {
-                closed = true;
-                break;
-            }
-        }
-        if !closed {
-            break; // unterminated tag: drop the remainder
+        let end = idx + 1 + gt_rel;
+        while ci < chars.len() && chars[ci].0 <= end {
+            ci += 1;
         }
     }
     out
+}
+
+fn looks_like_html_tag(inner: &str) -> bool {
+    let inner = inner.trim();
+    if inner.is_empty() || inner.contains('@') {
+        return false;
+    }
+    if inner.starts_with('!') || inner.starts_with('?') || inner.starts_with('/') {
+        return true;
+    }
+    let mut parts = inner.split_whitespace();
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    let name = name.trim_end_matches('/');
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':') {
+        return false;
+    }
+    for p in parts {
+        let p = p.trim_end_matches('/');
+        if p == "&&" || p == "||" {
+            return false;
+        }
+    }
+    true
+}
+
+/// Keep a result URL only when it is http(s) without userinfo.
+pub fn http_url(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 /// Decode common HTML/XML entities: `&amp; &lt; &gt; &quot; &apos; &#39; &#x41;`.
@@ -325,14 +366,22 @@ pub fn extract_tag(segment: &str, tag: &str) -> String {
 /// Value of the first `attr="..."` in `segment` (e.g. `href`, `label`).
 pub fn extract_attr(segment: &str, attr: &str) -> String {
     let needle = format!("{attr}=\"");
-    let Some(start) = segment.find(&needle) else {
-        return String::new();
-    };
-    let rest = &segment[start + needle.len()..];
-    let Some(end) = rest.find('"') else {
-        return String::new();
-    };
-    rest[..end].to_string()
+    let mut from = 0;
+    while let Some(rel) = segment[from..].find(&needle) {
+        let start = from + rel;
+        let at_boundary = start == 0
+            || segment.as_bytes()[start - 1].is_ascii_whitespace()
+            || segment.as_bytes()[start - 1] == b'<';
+        if at_boundary {
+            let rest = &segment[start + needle.len()..];
+            let Some(end) = rest.find('"') else {
+                return String::new();
+            };
+            return rest[..end].to_string();
+        }
+        from = start + 1;
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -435,6 +484,12 @@ mod tests {
         assert_eq!(strip_tags("a <b>bold</b> c"), "a bold c");
         assert_eq!(strip_tags("3 < 4 and 5 > 2"), "3 < 4 and 5 > 2");
         assert_eq!(strip_tags("<p>text</p>"), "text");
+        assert_eq!(strip_tags("if a<b && c>d"), "if a<b && c>d");
+        assert_eq!(strip_tags("n<p"), "n<p");
+        assert_eq!(
+            strip_tags("Alice <alice@example.com> wrote"),
+            "Alice <alice@example.com> wrote"
+        );
     }
 
     #[test]

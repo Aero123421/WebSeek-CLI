@@ -8,7 +8,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::{normalize_snippet, strip_html};
@@ -49,12 +49,7 @@ impl SearchEngine for Wikipedia {
     }
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
-        let lang = opts.lang.as_deref().unwrap_or("en");
-        if !is_valid_wiki_lang(lang) {
-            return Err(Error::Config(format!(
-                "invalid --lang '{lang}' for wikipedia (expected a short language label such as en, ja, or zh-yue)"
-            )));
-        }
+        let lang = canonicalize_wiki_lang(opts.lang.as_deref().unwrap_or("en"))?;
         let base = self
             .endpoint
             .clone()
@@ -75,11 +70,28 @@ impl SearchEngine for Wikipedia {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("wikipedia request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        parse_results(&body, lang)
+        Ok(dedupe_and_truncate(
+            parse_results(&body, &lang)?,
+            opts.count,
+            |r| &r.url,
+        ))
+    }
+}
+
+fn canonicalize_wiki_lang(lang: &str) -> Result<String> {
+    let s = lang.trim().to_ascii_lowercase();
+    if !is_valid_wiki_lang(&s) {
+        return Err(Error::Config(format!(
+            "invalid --lang '{lang}' for wikipedia (expected a short language label such as en, ja, or zh-yue)"
+        )));
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 2 && parts[1].len() == 2 {
+        Ok(parts[0].to_string())
+    } else {
+        Ok(s)
     }
 }
 
