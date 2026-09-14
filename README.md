@@ -51,14 +51,14 @@ it against `SHA256SUMS.txt`, and put the `webseek` binary on your PATH:
 
 ```sh
 # Linux / macOS
-tar -xzf webseek-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf webseek-v0.3.1-x86_64-unknown-linux-gnu.tar.gz
 chmod +x webseek
 sudo mv webseek /usr/local/bin/
 ```
 
 ```powershell
 # Windows
-Expand-Archive webseek-v0.3.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
+Expand-Archive webseek-v0.3.1-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
 ```
 
 Or build from source (Rust 1.86+, checked in CI):
@@ -169,7 +169,7 @@ not fetching it.
 | Mode | When |
 |---|---|
 | `--json` | Force one JSON document on stdout |
-| `--jsonl` | One JSON **object** per line (stream-friendly) |
+| `--jsonl` | One JSON **object** per line (stream-friendly). `search`/`images` emit one hit per line (no envelope; zero hits ⇒ zero lines). A `--download` run adds a final `{"downloaded":[...]}` object. |
 | `--pretty` | Force human/colored text |
 | *(auto)* | JSON when stdout is not a TTY, else pretty text |
 
@@ -494,8 +494,8 @@ Nothing is published to crates.io.
 To publish a release:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 ## Roadmap

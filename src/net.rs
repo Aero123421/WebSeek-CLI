@@ -199,7 +199,17 @@ fn normalize(ip: IpAddr) -> IpAddr {
             (b & 0xff) as u8,
         ));
     }
-    // `::ffff:0:x.y.z.w` style compat addresses.
+    // RFC 2765 IPv4-translated (`::ffff:0:x.y.z.w`, prefix ::ffff:0:0:0/96).
+    // Distinct from IPv4-mapped `::ffff:x.y.z.w` (handled by to_ipv4_mapped).
+    if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0xffff && seg[5] == 0 {
+        return IpAddr::V4(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+            (seg[7] >> 8) as u8,
+            (seg[7] & 0xff) as u8,
+        ));
+    }
+    // Deprecated IPv4-compatible `::x.y.z.w`.
     if let Some(v4) = v6.to_ipv4() {
         if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 {
             return IpAddr::V4(v4);
@@ -357,6 +367,9 @@ mod tests {
             "http://100.100.100.200/",    // Alibaba metadata (CGNAT range)
             "http://[fd00:ec2::254]/",    // AWS IPv6 metadata (unique local)
             "http://[::ffff:127.0.0.1]/", // IPv4-mapped loopback
+            "http://[::ffff:0:127.0.0.1]/", // RFC 2765 IPv4-translated loopback
+            "http://[::ffff:0:169.254.169.254]/", // translated cloud metadata
+            "http://[::ffff:0:10.0.0.1]/", // translated RFC1918
             "http://[64:ff9b::7f00:1]/",  // NAT64-wrapped loopback
             "http://[64:ff9b:1::1]/",     // local-use NAT64 prefix
             "http://[2002:7f00:1::]/",    // 6to4-wrapped loopback

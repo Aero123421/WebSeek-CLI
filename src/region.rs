@@ -178,10 +178,14 @@ pub fn ddg_kl(region: &str) -> Option<String> {
     let loc = parse_region(region);
     let script = loc.script.as_deref();
     match (loc.country, loc.language) {
-        (Some(country), Some(language)) => {
+        (Some(country), Some(language)) if country == "419" && language == "es" => {
+            Some("xl-es".into())
+        }
+        (Some(country), Some(language)) if country.len() == 2 => {
             let language = ddg_language(&language, script, &country);
             Some(format!("{}-{language}", ddg_country(&country)))
         }
+        (Some(_), Some(_)) => None,
         (Some(country), None) => ddg_default_language(&country)
             .map(|language| format!("{}-{language}", ddg_country(&country))),
         (None, _) => None,
@@ -190,7 +194,9 @@ pub fn ddg_kl(region: &str) -> Option<String> {
 
 /// Bing `cc` value: the 2-letter country code, if any.
 pub fn bing_cc(region: &str) -> Option<String> {
-    parse_region(region).country
+    parse_region(region)
+        .country
+        .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
 /// Bing `setlang` value derived from the region's language, if any.
@@ -283,5 +289,7 @@ mod tests {
             parse_region("es-419"),
             locale(Some("es"), None, Some("419"))
         );
+        assert_eq!(ddg_kl("es-419"), Some("xl-es".into()));
+        assert_eq!(bing_cc("es-419"), None);
     }
 }

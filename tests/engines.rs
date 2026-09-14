@@ -29,7 +29,7 @@ const DDG_HTML: &str = r#"<html><body>
 
 const BING_HTML: &str = r#"<html><body><ol id="b_results">
   <li class="b_algo">
-    <h2><a href="https://www.bing.com/ck/a?u=aHR0cHM6Ly9leGFtcGxlLmNvbS8x">Bing hit one</a></h2>
+    <h2><a href="https://www.bing.com/ck/a?!&&p=1&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS8x">Bing hit one</a></h2>
     <div class="b_caption"><p>bing snippet</p></div>
   </li>
 </ol></body></html>"#;

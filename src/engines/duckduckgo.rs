@@ -54,16 +54,11 @@ impl SearchEngine for DuckDuckGo {
         let resp = opts
             .send(client.get(url))
             .map_err(|e| Error::Network(format!("duckduckgo request failed: {e}")))?;
-        let status = resp.status();
-        if status.as_u16() == 202 || status.as_u16() == 429 || status.as_u16() == 403 {
-            return Err(Error::RateLimited(format!(
-                "duckduckgo answered HTTP {status} (retry later or lower request rate)"
-            )));
-        }
-        if !status.is_success() {
-            return Err(Error::Http(status.as_u16()));
-        }
+        crate::http::scrape_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
+        if crate::reader::max_nesting_depth(&body) > crate::reader::MAX_NESTING_DEPTH {
+            return Err(Error::Parse("document nesting too deep".into()));
+        }
         // A 200 that is really an interstitial must be an error, not an empty
         // result set, or fallback never triggers.
         if crate::engines::looks_like_challenge(&body) {
@@ -105,7 +100,9 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
         if let Some(a) = result.select(&link_sel).next() {
             title = a.text().collect::<String>().trim().to_string();
             if let Some(href) = a.value().attr("href") {
-                url = decode_redirect(href).unwrap_or_else(|| href.to_string());
+                url = decode_redirect(href)
+                    .or_else(|| crate::text::http_url(href))
+                    .unwrap_or_default();
             }
         }
         if title.is_empty() || url.is_empty() {
@@ -131,15 +128,23 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
 fn decode_redirect(href: &str) -> Option<String> {
     let absolute = if let Some(rest) = href.strip_prefix("//") {
         format!("https:{rest}")
+    } else if href.starts_with('/') {
+        format!("https://duckduckgo.com{href}")
     } else {
         href.to_string()
     };
     let url = Url::parse(&absolute).ok()?;
-    if url.host_str() != Some("duckduckgo.com") || url.path() != "/l/" {
+    let host = url.host_str().unwrap_or("");
+    let is_ddg = host == "duckduckgo.com" || host.ends_with(".duckduckgo.com");
+    let is_l = url.path() == "/l/" || url.path() == "/l";
+    if !is_ddg || !is_l {
         return None;
     }
-    let raw = url.query_pairs().find(|(k, _)| k == "uddg")?.1;
-    Some(raw.into_owned())
+    let candidate = url
+        .query_pairs()
+        .find(|(k, _)| k == "uddg")
+        .map(|(_, v)| v.into_owned())?;
+    crate::text::http_url(&candidate)
 }
 
 #[cfg(test)]
@@ -202,5 +207,14 @@ mod tests {
         assert_eq!(decode_redirect("https://example.com/plain"), None);
         // Non-redirect DDG links stay untouched (returned by caller as-is).
         assert_eq!(decode_redirect("//duckduckgo.com/about"), None);
+        assert_eq!(
+            decode_redirect("/l/?uddg=https%3A%2F%2Fexample.com%2Frel").as_deref(),
+            Some("https://example.com/rel")
+        );
+        assert_eq!(
+            decode_redirect("https://html.duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx")
+                .as_deref(),
+            Some("https://example.com/x")
+        );
     }
 }

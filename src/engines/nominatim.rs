@@ -12,7 +12,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::{join_meta, normalize_snippet};
@@ -71,11 +71,13 @@ impl SearchEngine for Nominatim {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("nominatim request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        parse_results(&body)
+        Ok(dedupe_and_truncate(
+            parse_results(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 

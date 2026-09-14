@@ -7,7 +7,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::models::{SearchOpts, SearchResult};
 use crate::text::{join_meta, normalize_snippet};
@@ -34,13 +34,14 @@ impl HackerNews {
 
 #[derive(Deserialize)]
 struct Resp {
-    #[serde(default)]
     hits: Vec<Hit>,
 }
 #[derive(Deserialize)]
 struct Hit {
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    story_title: Option<String>,
     #[serde(default)]
     url: Option<String>,
     #[serde(default, rename = "objectID")]
@@ -60,18 +61,21 @@ impl SearchEngine for HackerNews {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let params: Vec<(&str, &str)> = vec![("query", query), ("hitsPerPage", &limit)];
+        let params: Vec<(&str, &str)> =
+            vec![("query", query), ("hitsPerPage", &limit), ("tags", "story")];
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("hackernews request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        parse_results(&body)
+        Ok(dedupe_and_truncate(
+            parse_results(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -83,7 +87,10 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
         .hits
         .into_iter()
         .filter_map(|h| {
-            let title = h.title.filter(|t| !t.is_empty())?;
+            let title = h
+                .title
+                .filter(|t| !t.is_empty())
+                .or_else(|| h.story_title.filter(|t| !t.is_empty()))?;
             let url = h
                 .url
                 .filter(|u| !u.is_empty())

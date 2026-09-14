@@ -276,6 +276,49 @@ enum Source {
 }
 
 fn default_path() -> PathBuf {
+    let preferred = preferred_config_path();
+    if preferred.is_file() {
+        return preferred;
+    }
+    let legacy = legacy_config_path();
+    if legacy.is_file() {
+        return legacy;
+    }
+    preferred
+}
+
+/// Paths documented in the README.
+fn preferred_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("webseek").join("config.toml");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("webseek")
+                .join("config.toml");
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("webseek").join("config.toml");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("webseek")
+            .join("config.toml");
+    }
+    PathBuf::from("webseek-config.toml")
+}
+
+/// Historical `directories` crate path (`dev.webseek.webseek` on macOS).
+fn legacy_config_path() -> PathBuf {
     directories::ProjectDirs::from("dev", "webseek", "webseek")
         .map(|d| d.config_dir().join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("webseek-config.toml"))

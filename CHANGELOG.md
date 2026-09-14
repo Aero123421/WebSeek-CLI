@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-14
+
+### Fixed
+
+- Nesting-depth hang guard now applies to `--html` (title is a linear scan) and
+  to Bing/DuckDuckGo HTML parsers. `<svg/>` no longer leaves the tokenizer in
+  foreign mode, which undercounted later HTML `<div/>`.
+- RFC 2765 IPv4-translated addresses (`::ffff:0:a.b.c.d`) are unwrapped and
+  blocked like other IPv4-in-IPv6 embeddings.
+- `Retry-After` is honoured up to 60s instead of being clamped to the 8s
+  backoff cap. Bing RSS 429/403 now propagate instead of falling through to an
+  empty HTML parse that looked like "no results".
+- Search/image cache keys include the fallback flag; empty result sets are not
+  cached. Fetch keys include `allow_private`. `cache info` reports expired
+  entries seen on load.
+- robots.txt: strip a leading UTF-8 BOM, parse a truncated prefix instead of
+  fail-open, percent-encode non-ASCII patterns, and do not hold the checker
+  mutex across the HTTP fetch.
+- Image downloads without `--overwrite` stage via tempfile, so a failed write
+  cannot leave a stub that blocks later runs.
+- Config paths match the README on Windows/macOS, with a fallback to the old
+  `directories` crate location.
+- Density scoring ignores ads/scripts; in-article `<header>` headlines are
+  kept. `http-equiv` charset detection requires the Content-Type attribute.
+- DuckDuckGo unwraps relative `/l/?uddg=` redirects and keeps only http(s)
+  URLs. Image JSON safe-search sends `p=1`.
+- Official APIs map 429/202 to `kind: rate_limited`. PyPI rejects `.`/`..`
+  names. Wikipedia `--lang EN`/`en-US` canonicalizes. PubMed surfaces
+  `esearchresult.ERROR`. Hacker News requests `tags=story`.
+- Feed parser only reads direct `item`/`entry` children; Atom `rel="self"`
+  no longer becomes the link; RSS links are trimmed.
+- `--open 0`, `--timeout 0`, and `--max-chars 0` are usage errors. `--open`
+  launches the canonical URL. Engine validation only runs for the command that
+  uses that engine.
+- CLI tests cover default egress blocking of loopback and `--fail-if-all-error`
+  when every URL fails.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added
@@ -275,7 +312,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suite: parser unit tests with fixtures, engine integration tests
   against a local mock server (wiremock, no network).
 
-[Unreleased]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Aero123421/WebSeek-CLI/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Aero123421/WebSeek-CLI/releases/tag/v0.1.0

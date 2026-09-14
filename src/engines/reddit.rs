@@ -11,11 +11,11 @@
 use reqwest::blocking::Client;
 use url::Url;
 
-use crate::engines::SearchEngine;
+use crate::engines::{dedupe_and_truncate, SearchEngine};
 use crate::error::{Error, Result};
 use crate::feed;
 use crate::models::{SearchOpts, SearchResult};
-use crate::text::{normalize_snippet, strip_html};
+use crate::text::{join_meta, normalize_snippet, strip_html};
 
 const SEARCH_URL: &str = "https://www.reddit.com/search.rss";
 
@@ -52,11 +52,13 @@ impl SearchEngine for Reddit {
         let resp = opts
             .send_api(client.get(url))
             .map_err(|e| Error::Network(format!("reddit request failed: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(Error::Http(resp.status().as_u16()));
-        }
+        crate::http::api_status(resp.status().as_u16())?;
         let body = crate::http::response_text(resp)?;
-        parse_results(&body)
+        Ok(dedupe_and_truncate(
+            parse_results(&body)?,
+            opts.count,
+            |r| &r.url,
+        ))
     }
 }
 
@@ -65,24 +67,22 @@ impl SearchEngine for Reddit {
 pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
     Ok(feed::parse_entries(body)?
         .into_iter()
-        .filter(|entry| !entry.link.is_empty())
-        .map(|entry| {
-            let mut snippet = String::new();
-            if !entry.category.is_empty() {
-                snippet.push_str(&entry.category);
-                snippet.push_str(" · ");
-            }
-            if !entry.author.is_empty() {
-                snippet.push_str("by ");
-                snippet.push_str(&entry.author);
-                snippet.push_str(" · ");
-            }
-            snippet.push_str(&strip_html(&entry.summary));
-            SearchResult {
+        .filter_map(|entry| {
+            let url = crate::text::http_url(&entry.link)?;
+            let author = if entry.author.is_empty() {
+                String::new()
+            } else {
+                format!("by {}", entry.author)
+            };
+            Some(SearchResult {
                 title: entry.title,
-                url: entry.link,
-                snippet: normalize_snippet(&snippet),
-            }
+                url,
+                snippet: normalize_snippet(&join_meta(&[
+                    &entry.category,
+                    &author,
+                    &strip_html(&entry.summary),
+                ])),
+            })
         })
         .collect())
 }

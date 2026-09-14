@@ -59,7 +59,11 @@ impl Error {
     pub fn is_engine_retryable(&self) -> bool {
         matches!(
             self,
-            Error::RateLimited(_) | Error::Network(_) | Error::Parse(_) | Error::Http(_)
+            Error::RateLimited(_)
+                | Error::Network(_)
+                | Error::Parse(_)
+                | Error::Http(_)
+                | Error::TooLarge { .. }
         )
     }
 
@@ -123,7 +127,7 @@ mod tests {
         assert!(!Error::Config("bad engine".into()).is_engine_retryable());
         assert!(!Error::robots_blocked("https://x").is_engine_retryable());
         assert!(!Error::Blocked("x".into()).is_engine_retryable());
-        assert!(!Error::TooLarge { limit: 1 }.is_engine_retryable());
+        assert!(Error::TooLarge { limit: 1 }.is_engine_retryable());
     }
 
     #[test]

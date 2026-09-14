@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Bump when a change to extraction/serialization makes old entries wrong.
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+pub const CACHE_SCHEMA_VERSION: u32 = 4;
 
 /// Injectable clock (unix seconds) so TTL tests need no sleeping.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -82,6 +82,8 @@ pub struct Cache {
     next_seq: u64,
     dirty: bool,
     clock: Clock,
+    /// Expired entries seen on load, before budget eviction.
+    expired_on_load: usize,
 }
 
 fn system_clock() -> Clock {
@@ -128,10 +130,17 @@ impl Cache {
             next_seq,
             dirty: false,
             clock,
+            expired_on_load: 0,
         };
+        cache.expired_on_load = cache
+            .entries
+            .values()
+            .filter(|v| cache.expired(v.ts))
+            .count();
         // A cache that shrank its limits must shrink on startup, not on the
-        // next write.
-        if cache.enforce_budgets() {
+        // next write. Skip when disabled so `cache info` can still report the
+        // on-disk file.
+        if cache.max_entries > 0 && cache.enforce_budgets() {
             cache.dirty = true;
         }
         cache
@@ -149,6 +158,7 @@ impl Cache {
             next_seq: 0,
             dirty: false,
             clock: system_clock(),
+            expired_on_load: 0,
         }
     }
 
@@ -175,10 +185,16 @@ impl Cache {
             return None;
         }
         let seq = self.next_seq;
+        let ties = self
+            .entries
+            .values()
+            .filter(|e| e.seq.saturating_add(1) == seq)
+            .count();
         let entry = self.entries.get_mut(key)?;
-        // Only rewrite when recency actually moved, so repeated hits on the
-        // newest entry do not force a save.
-        if entry.seq.saturating_add(1) < seq {
+        // Refresh unless this entry uniquely holds the current max seq.
+        // After a multi-process merge several keys can share seq=0, and
+        // treating all of them as "already newest" disabled LRU.
+        if entry.seq.saturating_add(1) < seq || ties > 1 {
             entry.seq = seq;
             self.next_seq = self.next_seq.saturating_add(1);
             self.dirty = true;
@@ -243,13 +259,12 @@ impl Cache {
     }
 
     pub fn info(&self) -> CacheInfo {
-        let expired = self.entries.values().filter(|v| self.expired(v.ts)).count();
         CacheInfo {
             path: self.path.display().to_string(),
             enabled: self.is_enabled(),
             entries: self.entries.len(),
             bytes: self.entries.values().map(|v| v.bytes).sum(),
-            expired,
+            expired: self.expired_on_load,
             ttl_secs: self.ttl_secs,
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
@@ -394,8 +409,8 @@ fn estimate(value: &Value) -> u64 {
 }
 
 fn read_file(path: &Path) -> Option<HashMap<String, CachedValue>> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<HashMap<String, CachedValue>>(&raw) {
+    let raw = std::fs::read(path).ok()?;
+    match serde_json::from_slice::<HashMap<String, CachedValue>>(&raw) {
         Ok(map) => Some(map),
         Err(_) => {
             crate::output::warn(&format!("ignoring corrupt cache file {}", path.display()));
@@ -465,7 +480,7 @@ pub fn cache_key(parts: &[&str]) -> String {
 }
 
 /// Key for a page fetch. Shared by single and batch fetch paths.
-pub fn fetch_key(url: &str, opts: &crate::models::FetchOpts) -> String {
+pub fn fetch_key(url: &str, opts: &crate::models::FetchOpts, allow_private: bool) -> String {
     cache_key(&[
         "fetch",
         url,
@@ -473,12 +488,18 @@ pub fn fetch_key(url: &str, opts: &crate::models::FetchOpts) -> String {
         &opts.max_chars.to_string(),
         &opts.raw_html.to_string(),
         &opts.markdown.to_string(),
+        if allow_private { "1" } else { "0" },
     ])
 }
 
 /// Key by requested engine, not fallback responder, so a repeated request can
 /// find the answer that was stored after fallback.
-pub fn search_key(requested_engine: &str, query: &str, opts: &crate::models::SearchOpts) -> String {
+pub fn search_key(
+    requested_engine: &str,
+    query: &str,
+    opts: &crate::models::SearchOpts,
+    fallback: bool,
+) -> String {
     cache_key(&[
         "search",
         requested_engine,
@@ -487,16 +508,24 @@ pub fn search_key(requested_engine: &str, query: &str, opts: &crate::models::Sea
         opts.lang.as_deref().unwrap_or(""),
         opts.region.as_deref().unwrap_or(""),
         &opts.safe.to_string(),
+        if fallback { "1" } else { "0" },
     ])
 }
 
-pub fn images_key(requested_engine: &str, query: &str, count: usize, safe: bool) -> String {
+pub fn images_key(
+    requested_engine: &str,
+    query: &str,
+    count: usize,
+    safe: bool,
+    fallback: bool,
+) -> String {
     cache_key(&[
         "images",
         requested_engine,
         query,
         &count.to_string(),
         &safe.to_string(),
+        if fallback { "1" } else { "0" },
     ])
 }
 
@@ -659,7 +688,7 @@ mod tests {
     #[test]
     fn real_key_builders_include_every_result_changing_option() {
         let fetch = crate::models::FetchOpts::default();
-        let base = fetch_key("https://x", &fetch);
+        let base = fetch_key("https://x", &fetch, false);
         for changed in [
             crate::models::FetchOpts {
                 max_bytes: 17,
@@ -678,14 +707,15 @@ mod tests {
                 ..fetch.clone()
             },
         ] {
-            assert_ne!(base, fetch_key("https://x", &changed));
+            assert_ne!(base, fetch_key("https://x", &changed, false));
         }
-        assert_ne!(base, fetch_key("https://y", &fetch));
+        assert_ne!(base, fetch_key("https://y", &fetch, false));
+        assert_ne!(base, fetch_key("https://x", &fetch, true));
 
         let search = crate::models::SearchOpts::default();
-        let base = search_key("bing", "q", &search);
-        assert_ne!(base, search_key("duckduckgo", "q", &search));
-        assert_ne!(base, search_key("bing", "other", &search));
+        let base = search_key("bing", "q", &search, true);
+        assert_ne!(base, search_key("duckduckgo", "q", &search, true));
+        assert_ne!(base, search_key("bing", "other", &search, true));
         assert_ne!(
             base,
             search_key(
@@ -694,14 +724,29 @@ mod tests {
                 &crate::models::SearchOpts {
                     count: 9,
                     ..search.clone()
-                }
+                },
+                true
+            )
+        );
+        assert_ne!(base, search_key("bing", "q", &search, false));
+        assert_ne!(
+            base,
+            search_key(
+                "bing",
+                "q",
+                &crate::models::SearchOpts {
+                    lang: Some("ja".into()),
+                    ..search.clone()
+                },
+                true
             )
         );
 
-        let base = images_key("bing", "q", 5, false);
-        assert_ne!(base, images_key("bing", "q", 6, false));
-        assert_ne!(base, images_key("bing", "q", 5, true));
-        assert_ne!(base, images_key("duckduckgo", "q", 5, false));
+        let base = images_key("bing", "q", 5, false, true);
+        assert_ne!(base, images_key("bing", "q", 6, false, true));
+        assert_ne!(base, images_key("bing", "q", 5, true, true));
+        assert_ne!(base, images_key("duckduckgo", "q", 5, false, true));
+        assert_ne!(base, images_key("bing", "q", 5, false, false));
     }
 
     #[test]

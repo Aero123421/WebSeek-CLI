@@ -387,9 +387,13 @@ pub fn looks_like_challenge(body: &str) -> bool {
         "class=\"g-recaptcha\"",
         "id=\"challenge-form\"",
         "id=\"cf-challenge-running\"",
+        "id=\"anomaly-modal\"",
+        "anomaly-modal",
+        "anomaly.js",
         "cf-browser-verification",
         "/recaptcha/api.js",
         "challenges.cloudflare.com/turnstile",
+        "/cdn-cgi/challenge-platform/",
         "name=\"captcha_answer\"",
     ];
     /// Phrases that indicate a challenge in the <title> of a very small page.

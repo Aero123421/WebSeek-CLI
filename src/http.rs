@@ -158,9 +158,13 @@ fn send_with_retry_policy_inner(
                     // When the server tells us how long to wait, believe it:
                     // our own backoff is a guess, `Retry-After` is an answer.
                     match retry_after_secs(&resp) {
-                        Some(secs) => std::thread::sleep(Duration::from_millis(
-                            (secs * 1000).min(policy.max_ms),
-                        )),
+                        // Honour the parsed wait (already capped at 60s). Do
+                        // not clamp to `max_ms` — that bound is for our own
+                        // backoff guess, not for a server-supplied delay.
+                        Some(0) => jittered_sleep(attempt, policy),
+                        Some(secs) => {
+                            std::thread::sleep(Duration::from_millis(secs.saturating_mul(1000)))
+                        }
                         None => jittered_sleep(attempt, policy),
                     }
                     continue;
@@ -233,14 +237,7 @@ pub fn response_text(resp: Response) -> Result<String> {
 /// Decode using HTTP charset, BOM, an HTML meta charset, then UTF-8.
 pub fn decode_text(bytes: &[u8], content_type: Option<&str>) -> String {
     let charset = content_type
-        .and_then(|ct| {
-            ct.split(';').skip(1).find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                k.trim()
-                    .eq_ignore_ascii_case("charset")
-                    .then(|| v.trim().trim_matches('"'))
-            })
-        })
+        .and_then(crate::reader::charset_from_content_type_str)
         .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
         .or_else(|| encoding_rs::Encoding::for_bom(bytes).map(|(enc, _)| enc))
         .or_else(|| {
@@ -250,6 +247,30 @@ pub fn decode_text(bytes: &[u8], content_type: Option<&str>) -> String {
         .unwrap_or(encoding_rs::UTF_8);
     let (text, _, _) = charset.decode(bytes);
     text.into_owned()
+}
+
+/// Map a finished (post-retry) status for official APIs.
+/// HTTP 202 is success-class but means "try again" here, same as 429.
+pub fn api_status(status: u16) -> Result<()> {
+    match status {
+        202 | 429 => Err(Error::RateLimited(format!(
+            "upstream answered HTTP {status} (retry later or lower request rate)"
+        ))),
+        s if (200..300).contains(&s) => Ok(()),
+        other => Err(Error::Http(other)),
+    }
+}
+
+/// Map a finished status for scraped HTML endpoints. 403 is treated as a
+/// bot challenge, matching DuckDuckGo/Bing behaviour.
+pub fn scrape_status(status: u16) -> Result<()> {
+    match status {
+        202 | 403 | 429 => Err(Error::RateLimited(format!(
+            "search engine answered HTTP {status} (retry later or lower request rate)"
+        ))),
+        s if (200..300).contains(&s) => Ok(()),
+        other => Err(Error::Http(other)),
+    }
 }
 
 /// Recover policy failures wrapped inside reqwest's redirect/DNS errors.
@@ -276,10 +297,8 @@ pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 202 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// `Retry-After` in delta-seconds form, if the server sent one.
-///
-/// Only the numeric form is honored; the HTTP-date form would need a date
-/// parser for a header that upstreams here send as seconds anyway.
+/// `Retry-After` as seconds, honouring both delta-seconds and IMF-fixdate.
+/// The result is already capped at 60s by [`parse_retry_after_at`].
 fn retry_after_secs(resp: &Response) -> Option<u64> {
     parse_retry_after(resp.headers().get(header::RETRY_AFTER)?.to_str().ok()?)
 }

@@ -120,7 +120,9 @@ fn build_result_with_base(
 
     if opts.raw_html {
         // `--html` is still bounded: an agent asking for raw markup should not
-        // be handed megabytes it never asked to pay for.
+        // be handed megabytes it never asked to pay for. Title is a linear
+        // scan so this path cannot reintroduce the quadratic html5ever hang
+        // that the nesting guard exists to stop.
         let total = raw.chars().count();
         let over_char_cap = total > max_chars;
         let text = if over_char_cap {
@@ -130,7 +132,7 @@ fn build_result_with_base(
         };
         return Ok(FetchResult {
             url: url.to_string(),
-            title: extract_title_from(&Html::parse_document(raw)),
+            title: extract_title_linear(raw),
             chars: text.chars().count(),
             truncated: body_capped || over_char_cap,
             text,
@@ -161,7 +163,7 @@ pub fn charset_from_content_type_str(value: &str) -> Option<String> {
         if !k.trim().eq_ignore_ascii_case("charset") {
             return None;
         }
-        let v = v.trim().trim_matches('"');
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
         (!v.is_empty()).then(|| v.to_string())
     })
 }
@@ -197,13 +199,14 @@ fn meta_charset(bytes: &[u8]) -> Option<Vec<u8>> {
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
         // <meta http-equiv="Content-Type" content="text/html; charset=euc-jp">
-        // Checked first: the word "charset" also occurs *inside* that quoted
-        // `content` value, so looking for a bare charset attribute first
-        // matched the wrong thing and returned a label with a stray quote.
-        if tag.contains("http-equiv") {
-            if let Some(content) = attr_value(tag, "content") {
-                if let Some(cs) = charset_from_content_type_str(&content) {
-                    return Some(cs.into_bytes());
+        // The attribute value is checked, not a substring of the tag: a
+        // description that mentions "http-equiv" must not steal the charset.
+        if let Some(he) = attr_value(tag, "http-equiv") {
+            if he.eq_ignore_ascii_case("content-type") {
+                if let Some(content) = attr_value(tag, "content") {
+                    if let Some(cs) = charset_from_content_type_str(&content) {
+                        return Some(cs.into_bytes());
+                    }
                 }
             }
         }
@@ -223,43 +226,58 @@ pub(crate) fn meta_charset_label(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Read `name=value` from a lower-cased tag body, quoted or bare.
+/// Quoted values are skipped so `content="…charset=…"` cannot be mistaken
+/// for a `charset` attribute.
 fn attr_value(tag: &str, name: &str) -> Option<String> {
-    let mut rest = tag;
-    let mut consumed = 0usize;
-    loop {
-        let idx = rest.find(name)?;
-        // The name must start an attribute, not sit inside another one's
-        // value: `content="…charset=euc-jp"` contains "charset".
-        let at_boundary = idx + consumed == 0
-            || tag[..idx + consumed]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_whitespace());
-        if !at_boundary {
-            consumed += idx + name.len();
-            rest = &rest[idx + name.len()..];
-            continue;
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        let after = &rest[idx + name.len()..];
-        let trimmed = after.trim_start();
-        if let Some(eq) = trimmed.strip_prefix('=') {
-            let v = eq.trim_start();
-            let value = match v.chars().next() {
-                Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
-                // A bare value ends at whitespace or the next quote.
-                _ => v
-                    .split([' ', '\t', '\n', '\r', '"', '\''])
-                    .next()
-                    .unwrap_or_default(),
-            };
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let key = tag[start..i].trim();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let value = if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
             }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                i += 1;
+                let vstart = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                let v = tag.get(vstart..i).unwrap_or("").to_string();
+                if i < bytes.len() {
+                    i += 1;
+                }
+                v
+            } else {
+                let vstart = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                tag.get(vstart..i).unwrap_or("").to_string()
+            }
+        } else {
+            String::new()
+        };
+        if key.eq_ignore_ascii_case(name) && !value.is_empty() {
+            return Some(value);
         }
-        consumed += idx + name.len();
-        rest = &rest[idx + name.len()..];
     }
+    None
 }
 
 /// Elements with no end tag; they never open a level.
@@ -372,8 +390,8 @@ pub fn max_nesting_depth(html: &str) -> usize {
         }
 
         // Raw text: skip to the matching end tag so its contents cannot be
-        // mistaken for markup.
-        if RAW_TEXT.contains(&name.as_str()) && !self_closing {
+        // mistaken for markup. HTML `<script src=x/>` is not self-closing.
+        if RAW_TEXT.contains(&name.as_str()) {
             let close = format!("</{name}");
             match find_sub_ci(&bytes[i..], close.as_bytes()) {
                 Some(rel) => i += rel,
@@ -382,6 +400,11 @@ pub fn max_nesting_depth(html: &str) -> usize {
             continue;
         }
         if VOID_ELEMENTS.contains(&name.as_str()) || AUTO_CLOSING.contains(&name.as_str()) {
+            continue;
+        }
+        // HTML `<svg/>` / `<math/>` is a closed foreign element. Leaving
+        // foreign mode set would skip subsequent HTML `<div/>` and undercount.
+        if self_closing && matches!(name.as_str(), "svg" | "math") && foreign_from.is_none() {
             continue;
         }
         // `/>` closes a tag only in foreign content.
@@ -439,6 +462,21 @@ fn extract_title_from(doc: &Html) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Linear `<title>` scan so `--html` never runs html5ever.
+fn extract_title_linear(raw: &str) -> Option<String> {
+    let head = &raw[..raw.len().min(8192)];
+    let lower = head.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let after_name = &head[start + 6..];
+    let gt = after_name.find('>')?;
+    let inner = &after_name[gt + 1..];
+    let inner_lower = inner.to_ascii_lowercase();
+    let end = inner_lower.find("</title>")?;
+    let title = crate::text::strip_html(&inner[..end]);
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
 /// Extract the main content of a document. Returns `(title, text)`.
 ///
 /// Errors when the document is nested too deeply to process safely.
@@ -462,7 +500,7 @@ fn extract_text_inner_with_base(
     if depth > MAX_NESTING_DEPTH {
         return Err(Error::Parse(format!(
             "document nesting too deep ({depth} levels, limit {MAX_NESTING_DEPTH}); \
-             refusing to parse (use --html to get the raw bytes)"
+             refusing to parse"
         )));
     }
 
@@ -471,20 +509,23 @@ fn extract_text_inner_with_base(
     let doc = Html::parse_document(html);
     let title = extract_title_from(&doc);
 
-    let container = pick_container(&doc);
+    let (container, strip_chrome) = pick_container(&doc);
     let mut out = String::new();
-    walk_with_base(container, &mut out, markdown, base_url);
+    walk_with_base(container, &mut out, markdown, base_url, strip_chrome);
     let (text, dropped) = post_process(&out);
     Ok((title, text, dropped))
 }
 
 /// Non-content elements we never render or score.
-fn is_excluded(tag: &str, e: &scraper::node::Element) -> bool {
+fn is_excluded(tag: &str, e: &scraper::node::Element, strip_chrome: bool) -> bool {
     const TAGS: &[&str] = &[
-        "script", "style", "noscript", "template", "svg", "canvas", "iframe", "form", "nav",
-        "aside", "footer", "header",
+        "script", "style", "noscript", "template", "svg", "canvas", "iframe", "form",
     ];
+    const CHROME: &[&str] = &["nav", "aside", "footer", "header"];
     if TAGS.contains(&tag) {
+        return true;
+    }
+    if strip_chrome && CHROME.contains(&tag) {
         return true;
     }
     if e.attr("hidden").is_some() || e.attr("aria-hidden") == Some("true") {
@@ -501,11 +542,18 @@ fn is_excluded(tag: &str, e: &scraper::node::Element) -> bool {
     false
 }
 
-/// True if `node` lives inside an excluded subtree.
-fn in_excluded(mut node: NodeRef<'_, Node>) -> bool {
+/// True if `node` or an ancestor is excluded. `self_too` also checks `node`.
+fn in_excluded(mut node: NodeRef<'_, Node>, self_too: bool) -> bool {
+    if self_too {
+        if let Node::Element(e) = node.value() {
+            if is_excluded(e.name(), e, true) {
+                return true;
+            }
+        }
+    }
     while let Some(p) = node.parent() {
         if let Node::Element(e) = p.value() {
-            if is_excluded(e.name(), e) {
+            if is_excluded(e.name(), e, true) {
                 return true;
             }
         }
@@ -515,13 +563,15 @@ fn in_excluded(mut node: NodeRef<'_, Node>) -> bool {
 }
 
 /// Choose the main container without mutating the document.
-fn pick_container(doc: &Html) -> NodeRef<'_, Node> {
+/// The bool is whether to strip site chrome (`header`/`nav`/…) while walking:
+/// false inside a semantic `article`/`main` so in-article headlines survive.
+fn pick_container(doc: &Html) -> (NodeRef<'_, Node>, bool) {
     // 1. Prefer semantic containers.
     let semantic = Selector::parse("article, main, [role='main'], #content, .content")
         .unwrap_or_else(|_| unreachable!("static"));
     if let Some(first) = doc.select(&semantic).next() {
-        if !is_excluded(first.value().name(), first.value()) {
-            return *first;
+        if !is_excluded(first.value().name(), first.value(), false) {
+            return (*first, false);
         }
     }
 
@@ -536,7 +586,7 @@ fn pick_container(doc: &Html) -> NodeRef<'_, Node> {
     let mut best: Option<(usize, NodeRef<'_, Node>)> = None; // (score, parent)
     let mut seen = std::collections::HashSet::new();
     for block in body.select(&blocks) {
-        if in_excluded(*block) {
+        if in_excluded(*block, true) {
             continue;
         }
         let Some(parent) = block.parent() else {
@@ -545,19 +595,21 @@ fn pick_container(doc: &Html) -> NodeRef<'_, Node> {
         if !seen.insert(parent.id()) {
             continue;
         }
-        let score = text_len(&parent);
+        let score = visible_text_len(&parent);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, parent));
         }
     }
     match best {
-        Some((score, node)) if score >= 200 => node,
-        _ => *body,
+        Some((score, node)) if score >= 200 => (node, true),
+        _ => (*body, true),
     }
 }
 
-fn text_len(node: &NodeRef<'_, Node>) -> usize {
-    node.descendants()
+/// Text length that ignores excluded subtrees (`script`, `.ad`, …).
+fn visible_text_len(root: &NodeRef<'_, Node>) -> usize {
+    root.descendants()
+        .filter(|n| n.value().as_text().is_some() && !in_excluded(*n, true))
         .filter_map(|n| n.value().as_text())
         .map(|t| t.text.trim().chars().count())
         .sum()
@@ -585,7 +637,7 @@ enum Step<'a> {
 /// run. An explicit stack makes depth a heap concern instead.
 #[cfg(test)]
 fn walk(root: NodeRef<'_, Node>, out: &mut String, markdown: bool) {
-    walk_with_base(root, out, markdown, None);
+    walk_with_base(root, out, markdown, None, true);
 }
 
 fn walk_with_base(
@@ -593,6 +645,7 @@ fn walk_with_base(
     out: &mut String,
     markdown: bool,
     base_url: Option<&Url>,
+    strip_chrome: bool,
 ) {
     let mut stack = vec![Step::Enter(root)];
 
@@ -623,7 +676,7 @@ fn walk_with_base(
             Node::Text(t) => out.push_str(&t.text),
             Node::Element(e) => {
                 let tag = e.name();
-                if is_excluded(tag, e) {
+                if is_excluded(tag, e, strip_chrome) {
                     continue;
                 }
 
@@ -935,6 +988,10 @@ mod tests {
         // would look like hundreds of nested elements.
         let svg = format!("<div><svg>{}</svg></div>", "<path/>".repeat(500));
         assert_eq!(max_nesting_depth(&svg), 2);
+        // `<svg/>` must not leave the tokenizer in foreign mode, or later
+        // HTML `<div/>` would be skipped and the hang guard would undercount.
+        let mixed = format!("<svg/>{}", "<div/>".repeat(50));
+        assert_eq!(max_nesting_depth(&mixed), 50);
     }
 
     #[test]
@@ -999,6 +1056,16 @@ mod tests {
     }
 
     #[test]
+    fn http_equiv_in_a_description_does_not_steal_the_charset() {
+        let sjis: Vec<u8> = vec![0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea];
+        let mut body = b"<html><head><meta name=\"description\" content=\"talks about http-equiv; charset=iso-8859-1\"><meta charset=\"shift_jis\"><title>".to_vec();
+        body.extend_from_slice(&sjis);
+        body.extend_from_slice(b"</title></head><body></body></html>");
+        let decoded = decode_body(&body, None);
+        assert!(decoded.contains("日本語"), "not decoded: {decoded}");
+    }
+
+    #[test]
     fn http_equiv_content_type_declares_the_charset() {
         // The word "charset" also appears inside the quoted `content` value,
         // which used to match first and yield the label `shift_jis"`.
@@ -1037,5 +1104,37 @@ mod tests {
             Some("utf-8")
         );
         assert_eq!(charset_from_content_type_str("text/html"), None);
+        assert_eq!(
+            charset_from_content_type_str("text/html; charset='shift_jis'").as_deref(),
+            Some("shift_jis")
+        );
+    }
+
+    #[test]
+    fn density_scoring_ignores_ads_and_scripts() {
+        let html = r#"<html><body>
+            <div><script>xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</script><p>tiny</p></div>
+            <div><p>This is the real article paragraph that should be selected because it is long enough to pass the density floor and is not an advertisement.</p></div>
+        </body></html>"#;
+        let (_, text, _) = extract_text_inner(html, false).unwrap();
+        assert!(
+            text.contains("real article"),
+            "script text must not outscore the article: {text:?}"
+        );
+    }
+
+    #[test]
+    fn article_header_headline_is_kept() {
+        let html = "<html><body><article><header><h1>Headline</h1></header><p>Body paragraph stays.</p></article></body></html>";
+        let (_, text, _) = extract_text_inner(html, false).unwrap();
+        assert!(text.contains("Headline"), "got: {text:?}");
+        assert!(text.contains("Body paragraph stays."));
+    }
+
+    #[test]
+    fn html_mode_does_not_need_a_tree_parse_for_title() {
+        let raw = "<html><head><title>From linear scan</title></head><body></body></html>";
+        let fetched = build_result("https://x", raw, &opts(200, true, false), false).unwrap();
+        assert_eq!(fetched.title.as_deref(), Some("From linear scan"));
     }
 }

@@ -60,7 +60,15 @@ pub fn run() -> Result<()> {
     match &cli.cmd {
         Command::Init => {
             let path = config::Config::write_default(cli.config.as_deref())?;
-            output::note(&format!("wrote config to {}", path.display()));
+            if matches!(mode, Mode::Json | Mode::Jsonl) {
+                output::write_property(
+                    mode,
+                    "path",
+                    serde_json::Value::String(path.display().to_string()),
+                )?;
+            } else {
+                output::note(&format!("wrote config to {}", path.display()));
+            }
             return Ok(());
         }
         Command::Engines => {
@@ -106,8 +114,15 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    config::validate_engine(&cfg.engine)?;
-    config::validate_image_engine(&cfg.image_engine)?;
+    match &cli.cmd {
+        Command::Search { engine, .. } => {
+            config::validate_engine(engine.as_deref().unwrap_or(&cfg.engine))?;
+        }
+        Command::Images { engine, .. } => {
+            config::validate_image_engine(engine.as_deref().unwrap_or(&cfg.image_engine))?;
+        }
+        _ => {}
+    }
 
     let delay = cli.delay.map(Duration::from_millis).unwrap_or(cfg.delay);
     let timeout = cli.timeout.map(Duration::from_secs).unwrap_or(cfg.timeout);
@@ -162,7 +177,7 @@ pub fn run() -> Result<()> {
     }
     // Flush explicitly so a write failure is reported here rather than being
     // swallowed when stdout is dropped at exit.
-    let _ = std::io::stdout().flush();
+    std::io::stdout().flush()?;
     outcome
 }
 
@@ -391,10 +406,15 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 fn open_result_url(raw: &str, allow_external_schemes: bool) -> error::Result<()> {
+    if raw.chars().any(|c| c.is_ascii_control()) {
+        return Err(Error::Blocked(
+            "refusing to open a URL that contains control characters".into(),
+        ));
+    }
     let url =
         url::Url::parse(raw).map_err(|e| Error::Config(format!("invalid URL '{raw}': {e}")))?;
     net::check_open_url(&url, allow_external_schemes)?;
-    open::that(raw).map_err(|e| Error::Network(format!("cannot open browser: {e}")))
+    open::that(url.as_str()).map_err(|e| Error::Network(format!("cannot open browser: {e}")))
 }
 
 /// Tell the user on stderr how a partially-failed batch went; stdout stays
@@ -473,13 +493,14 @@ fn search_with_cache(
     // surface as-is rather than being quietly rerouted.
     let requested = engine_by_name(name)?.name();
 
-    let key = cache::search_key(requested, query, opts);
+    let fallback_on = (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback;
+    let key = cache::search_key(requested, query, opts, fallback_on);
     if let Some(hit) = cached::<SearchResult>(ctx, &key) {
         ctx.trace(&format!("{} results (cache hit)", hit.1));
         return Ok(hit);
     }
 
-    let order = if (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback {
+    let order = if fallback_on {
         engines::fallback_order(requested)
     } else {
         vec![requested]
@@ -504,13 +525,14 @@ fn images_with_cache(
 ) -> Result<(Vec<models::ImageResult>, &'static str)> {
     let requested = image_engine_by_name(name)?.name();
 
-    let key = cache::images_key(requested, query, count, safe);
+    let fallback_on = (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback;
+    let key = cache::images_key(requested, query, count, safe, fallback_on);
     if let Some(hit) = cached::<models::ImageResult>(ctx, &key) {
         ctx.trace(&format!("{} image results (cache hit)", hit.1));
         return Ok(hit);
     }
 
-    let order = if (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback {
+    let order = if fallback_on {
         engines::image_fallback_order(requested)
     } else {
         vec![requested]
@@ -549,6 +571,9 @@ fn cached<T: for<'de> Deserialize<'de>>(
 
 /// Store an answer under the key the *request* produced.
 fn store<T: Serialize>(ctx: &Ctx<'_>, key: String, engine_used: &str, results: &[T]) {
+    if results.is_empty() {
+        return;
+    }
     let Ok(mut c) = ctx.cache.lock() else { return };
     let doc = serde_json::to_value(CachedSearch {
         engine: engine_used.to_string(),

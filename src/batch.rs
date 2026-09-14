@@ -155,16 +155,14 @@ pub fn fetch_one(ctx: &BatchCtx<'_>, url: &str) -> crate::error::Result<(FetchRe
     // robots.txt is consulted before the cache: a cached copy is not
     // permission to have fetched it, and the two paths must agree on order.
     if ctx.respect_robots {
-        let allowed = match ctx.robots.lock() {
-            Ok(mut c) => c.is_allowed(ctx.client, ctx.pacer, url).unwrap_or(true),
-            Err(_) => true,
-        };
+        let allowed = crate::robots::check_allowed(ctx.robots.as_ref(), ctx.client, ctx.pacer, url)
+            .unwrap_or(true);
         if !allowed {
             return Err(Error::robots_blocked(url));
         }
     }
 
-    let key = crate::cache::fetch_key(url, ctx.opts);
+    let key = crate::cache::fetch_key(url, ctx.opts, ctx.policy.allow_private);
     if let Some(v) = ctx.cache.lock().ok().and_then(|mut c| c.get(&key)) {
         if let Ok(f) = serde_json::from_value::<FetchResult>(v) {
             return Ok((f, true));
