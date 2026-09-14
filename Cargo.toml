@@ -41,7 +41,7 @@ tempfile = "3"
 # its async runtime thread. reqwest already depends on Tokio; this enables the
 # one runtime API the resolver needs.
 tokio = { version = "1", features = ["rt"] }
-toml = "0.8"
+toml = "1.1"
 url = "2"
 
 [dev-dependencies]
