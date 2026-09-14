@@ -125,12 +125,9 @@ pub fn parse_entries(body: &str) -> Result<Vec<FeedEntry>> {
                                 }
                             }
                         }
-                        "category" => {
-                            if current.category.is_empty() {
-                                if let Some(label) = attr(&e, "label").or_else(|| attr(&e, "term"))
-                                {
-                                    current.category = label;
-                                }
+                        "category" if current.category.is_empty() => {
+                            if let Some(label) = attr(&e, "label").or_else(|| attr(&e, "term")) {
+                                current.category = label;
                             }
                         }
                         _ => {}

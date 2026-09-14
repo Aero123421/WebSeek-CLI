@@ -297,11 +297,8 @@ fn fetch_rules(
     let mut text = String::from_utf8_lossy(&body.bytes).into_owned();
     if body.truncated {
         // Honour the prefix (RFC 9309 / Google): drop only a torn last line.
-        if let Some(i) = text.rfind('\n') {
-            text.truncate(i + 1);
-        } else {
-            return None;
-        }
+        let i = text.rfind('\n')?;
+        text.truncate(i + 1);
     }
     Some(parse_robots(&text))
 }
