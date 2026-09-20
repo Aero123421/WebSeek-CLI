@@ -52,6 +52,8 @@ struct Hit {
     num_comments: Option<i64>,
     #[serde(default)]
     author: Option<String>,
+    #[serde(default, rename = "created_at_i")]
+    created_at: Option<i64>,
 }
 
 impl SearchEngine for HackerNews {
@@ -61,8 +63,15 @@ impl SearchEngine for HackerNews {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let params: Vec<(&str, &str)> =
+        let mut params: Vec<(&str, &str)> =
             vec![("query", query), ("hitsPerPage", &limit), ("tags", "story")];
+        // Pushed to Algolia: filtering client-side on relevance order can
+        // return nothing while recent matches sit past the count cutoff.
+        // The generic post-filter still enforces the exact window.
+        let filters = numeric_filters(opts)?;
+        if !filters.is_empty() {
+            params.push(("numericFilters", &filters));
+        }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
@@ -77,6 +86,26 @@ impl SearchEngine for HackerNews {
             |r| &r.url,
         ))
     }
+}
+
+/// `created_at_i` range for `--since`/`--until`, matching the generic
+/// `[since, until)` window. Garbage bounds are a config error, never a
+/// silent no-filter.
+fn numeric_filters(opts: &SearchOpts) -> Result<String> {
+    let (since, until) = crate::time::parse_window(
+        opts.since.as_deref(),
+        opts.until.as_deref(),
+        "--since",
+        "--until",
+    )?;
+    let mut parts = Vec::new();
+    if let Some(s) = since {
+        parts.push(format!("created_at_i>={}", s.timestamp()));
+    }
+    if let Some(u) = until {
+        parts.push(format!("created_at_i<{}", u.timestamp()));
+    }
+    Ok(parts.join(","))
 }
 
 /// Pure parser (unit-tested against fixtures).
@@ -104,6 +133,7 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
                 title: normalize_snippet(&title),
                 url,
                 snippet: normalize_snippet(&snippet),
+                published: h.created_at.and_then(crate::time::unix_to_rfc3339),
             })
         })
         .collect())

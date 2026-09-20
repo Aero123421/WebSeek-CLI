@@ -117,6 +117,8 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
             title,
             url,
             snippet: normalize_snippet(&snippet),
+            // DuckDuckGo HTML carries no per-result dates.
+            published: None,
         });
     }
     out

@@ -198,6 +198,79 @@ fn pypi_404_is_empty_not_error() {
 }
 
 #[test]
+fn hackernews_pushes_time_bounds_to_algolia() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        // The mock only answers when the range filter is present, so a
+        // missing param fails the test instead of passing silently.
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param(
+                "numericFilters",
+                "created_at_i>=1789776000,created_at_i<1789862400",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"hits":[{"objectID":"7","title":"Fresh","url":"https://x.dev","created_at_i":1789800000}]}"#,
+            ))
+            .mount(&server)
+            .await;
+    });
+    let engine = HackerNews::with_base(format!("{}/search", server.uri()));
+    let bound = SearchOpts {
+        since: Some("2026-09-19".into()),
+        until: Some("2026-09-20".into()),
+        ..opts()
+    };
+    let r = engine.search(&client(), "x", &bound).unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].published.as_deref(), Some("2026-09-19T06:40:00+00:00"));
+    // Garbage bounds fail loudly, never filter silently.
+    let bad = SearchOpts {
+        since: Some("someday".into()),
+        ..opts()
+    };
+    assert_eq!(
+        engine.search(&client(), "x", &bad).unwrap_err().kind(),
+        "config"
+    );
+}
+
+#[test]
+fn stackexchange_pushes_time_bounds_as_fromdate_todate() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/se"))
+            .and(query_param("fromdate", "1789776000"))
+            .and(query_param("todate", "1789862400"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"items":[{"title":"Q","link":"https://so/q/1","creation_date":1789800000}]}"#,
+            ))
+            .mount(&server)
+            .await;
+    });
+    let engine = StackExchange::with_base(format!("{}/se", server.uri()));
+    let bound = SearchOpts {
+        since: Some("2026-09-19".into()),
+        until: Some("2026-09-20".into()),
+        ..opts()
+    };
+    let r = engine.search(&client(), "x", &bound).unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].published.as_deref(), Some("2026-09-19T06:40:00+00:00"));
+    let bad = SearchOpts {
+        until: Some("24x".into()),
+        ..opts()
+    };
+    assert_eq!(
+        engine.search(&client(), "x", &bad).unwrap_err().kind(),
+        "config"
+    );
+}
+
+#[test]
 fn stackexchange_and_nominatim_full_pipeline() {
     let rt = setup_runtime();
     let server = rt.block_on(MockServer::start());
@@ -350,7 +423,9 @@ fn telegram_channel_full_pipeline_with_pagination() {
     let engine = Telegram::with_base(server.uri());
     let r = engine.search(&client(), "@testchannel", &opts()).unwrap();
     assert_eq!(r.len(), 3);
-    assert_eq!(r[0].title, "@testchannel · 2026-09-20");
+    // The date lives in `published` now; the title stays a bare handle.
+    assert_eq!(r[0].title, "@testchannel");
+    assert_eq!(r[0].published.as_deref(), Some("2026-09-20T10:00:00+00:00"));
     assert_eq!(r[0].url, "https://t.me/testchannel/99");
     assert_eq!(r[0].snippet, "First post · 10 views");
     assert_eq!(r[2].snippet, "Older post");

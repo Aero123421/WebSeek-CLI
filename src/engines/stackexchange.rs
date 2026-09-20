@@ -57,6 +57,8 @@ struct Item {
     answer_count: i64,
     #[serde(default)]
     is_answered: bool,
+    #[serde(default)]
+    creation_date: Option<i64>,
 }
 
 impl SearchEngine for StackExchange {
@@ -66,13 +68,30 @@ impl SearchEngine for StackExchange {
 
     fn search(&self, client: &Client, query: &str, opts: &SearchOpts) -> Result<Vec<SearchResult>> {
         let limit = opts.count.clamp(1, 50).to_string();
-        let params: Vec<(&str, &str)> = vec![
+        // Pushed to the API: filtering client-side on relevance order can
+        // return nothing while recent matches sit past the pagesize cutoff.
+        // The generic post-filter still enforces the exact window.
+        let (since_dt, until_dt) = crate::time::parse_window(
+            opts.since.as_deref(),
+            opts.until.as_deref(),
+            "--since",
+            "--until",
+        )?;
+        let since = since_dt.map(|dt| dt.timestamp().to_string());
+        let until = until_dt.map(|dt| dt.timestamp().to_string());
+        let mut params: Vec<(&str, &str)> = vec![
             ("order", "desc"),
             ("sort", "relevance"),
             ("q", query),
             ("site", &self.site),
             ("pagesize", &limit),
         ];
+        if let Some(ref v) = since {
+            params.push(("fromdate", v));
+        }
+        if let Some(ref v) = until {
+            params.push(("todate", v));
+        }
         let url = Url::parse_with_params(&self.base, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
@@ -110,6 +129,7 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
                 title: normalize_snippet(&unescape_entities(&it.title)),
                 url: it.link,
                 snippet: normalize_snippet(&join_meta(&[&tags, &score, &answers])),
+                published: it.creation_date.and_then(crate::time::unix_to_rfc3339),
             }
         })
         .collect())

@@ -122,6 +122,8 @@ pub fn parse_results(body: &str, lang: &str) -> Result<Vec<SearchResult>> {
             title: h.title.clone(),
             url: wiki_url(lang, &h.title),
             snippet: normalize_snippet(&strip_html(&h.snippet)),
+            // Full-text search hits carry no revision date.
+            published: None,
         })
         .collect())
 }

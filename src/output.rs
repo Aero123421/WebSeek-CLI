@@ -157,7 +157,8 @@ pub fn write_search_to(
             for (i, r) in results.iter().enumerate() {
                 let title = sanitize_line(&r.title);
                 let url = sanitize_line(&r.url);
-                writeln!(w, "{}", paint(&format!("{:>2}. {title}", i + 1), "1"))?;
+                let dated = format!("{title}{}", pretty_date(r));
+                writeln!(w, "{}", paint(&format!("{:>2}. {dated}", i + 1), "1"))?;
                 writeln!(w, "     {}", paint(&url, "36"))?;
                 if !r.snippet.is_empty() {
                     writeln!(w, "     {}", sanitize_line(&r.snippet))?;
@@ -166,6 +167,16 @@ pub fn write_search_to(
         }
     }
     Ok(())
+}
+
+/// Human-friendly date suffix for pretty output: ` (2026-09-20)`, or empty
+/// when the engine could not say. Only the calendar day is shown — the full
+/// instant stays in JSON.
+fn pretty_date(r: &SearchResult) -> String {
+    match r.published.as_deref().and_then(|p| p.get(..10)) {
+        Some(day) => format!(" ({})", sanitize_line(day)),
+        None => String::new(),
+    }
 }
 
 pub fn write_images(
@@ -346,7 +357,8 @@ pub fn write_run_to(
             for (i, r) in results.iter().enumerate() {
                 let title = sanitize_line(&r.title);
                 let url = sanitize_line(&r.url);
-                writeln!(w, "{}", paint(&format!("{:>2}. {title}", i + 1), "1"))?;
+                let dated = format!("{title}{}", pretty_date(r));
+                writeln!(w, "{}", paint(&format!("{:>2}. {dated}", i + 1), "1"))?;
                 writeln!(w, "     {}", paint(&url, "36"))?;
                 if !r.snippet.is_empty() {
                     writeln!(w, "     {}", sanitize_line(&r.snippet))?;
@@ -477,6 +489,7 @@ mod tests {
             title: "T".into(),
             url: "https://example.com".into(),
             snippet: "S".into(),
+            published: None,
         }
     }
 
@@ -510,12 +523,35 @@ mod tests {
     }
 
     #[test]
+    fn pretty_output_shows_the_calendar_day_when_known() {
+        set_color(ColorChoice::Never);
+        let dated = SearchResult {
+            published: Some("2026-09-20T07:57:08+00:00".into()),
+            ..sample_search()
+        };
+        let mut out = Vec::new();
+        write_search_to(
+            &mut out,
+            Mode::Pretty,
+            "q",
+            "fxtwitter",
+            &[dated, sample_search()],
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("T (2026-09-20)"), "{rendered:?}");
+        // The undated twin renders a bare title — no empty parens.
+        assert!(rendered.contains(" 2. T\n"), "{rendered:?}");
+    }
+
+    #[test]
     fn pretty_output_never_forwards_terminal_controls() {
         set_color(ColorChoice::Never);
         let result = SearchResult {
             title: "safe\u{1b}[2Jtitle".into(),
             url: "https://example.com/\u{202e}evil".into(),
             snippet: "hello\u{1b}]0;pwned".into(),
+            published: None,
         };
         let mut out = Vec::new();
         write_search_to(&mut out, Mode::Pretty, "q", "duckduckgo", &[result]).unwrap();
@@ -562,7 +598,7 @@ mod tests {
         write_search_to(&mut buf, Mode::Json, "q", "duckduckgo", &[sample_search()]).unwrap();
         assert_eq!(
             std::str::from_utf8(&buf).unwrap(),
-            "{\"query\":\"q\",\"engine\":\"duckduckgo\",\"count\":1,\"results\":[{\"title\":\"T\",\"url\":\"https://example.com\",\"snippet\":\"S\"}]}\n"
+            "{\"query\":\"q\",\"engine\":\"duckduckgo\",\"count\":1,\"results\":[{\"title\":\"T\",\"url\":\"https://example.com\",\"snippet\":\"S\",\"published\":null}]}\n"
         );
     }
 
@@ -583,7 +619,7 @@ mod tests {
             let v: Value = serde_json::from_str(line).unwrap();
             assert_eq!(
                 v,
-                json!({"title":"T","url":"https://example.com","snippet":"S"})
+                json!({"title":"T","url":"https://example.com","snippet":"S","published":null})
             );
         }
     }

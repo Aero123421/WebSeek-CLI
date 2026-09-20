@@ -132,8 +132,8 @@ pub static TEXT_REGISTRY: &[EngineSpec] = &[
         aliases: &["fx", "x"],
         kind: "news",
         description:
-            "X/Twitter posts via the FxTwitter API (no key; self-host with fxtwitter_base_url).",
-        example: "webseek search \"rust\" --engine fxtwitter",
+            "X/Twitter posts via the FxTwitter API (no key; self-host with fxtwitter_base_url). X operators (from:, OR) pass through; --feed picks latest/top/media.",
+        example: "webseek search \"from:rustlang OR from:tokio_rs\" --engine fxtwitter --since 24h",
         build: || Box::<fxtwitter::FxTwitter>::default(),
     },
     EngineSpec {
@@ -141,7 +141,7 @@ pub static TEXT_REGISTRY: &[EngineSpec] = &[
         aliases: &["tg"],
         kind: "news",
         description:
-            "Public Telegram channel posts (no key; the query is a channel: @name or t.me/name).",
+            "Public Telegram channel posts (no key; query is a channel, with optional in-channel keywords).",
         example: "webseek search \"@telegram\" --engine telegram",
         build: || Box::<telegram::Telegram>::default(),
     },

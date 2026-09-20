@@ -172,6 +172,8 @@ pub fn parse_html(html: &str) -> Vec<SearchResult> {
             title,
             url,
             snippet: normalize_snippet(&snippet),
+            // Bing HTML carries no per-result dates.
+            published: None,
         });
     }
     out
@@ -190,6 +192,7 @@ pub fn parse_rss(body: &str) -> Result<Vec<SearchResult>> {
                 title: normalize_snippet(&entry.title),
                 url,
                 snippet: normalize_snippet(&crate::text::strip_html(&entry.summary)),
+                published: crate::time::feed_date(&entry.published),
             })
         })
         .collect())
