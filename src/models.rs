@@ -19,6 +19,12 @@ pub struct SearchResult {
     pub url: String,
     /// Short excerpt, trimmed and single-line (context-friendly).
     pub snippet: String,
+    /// Publication instant as RFC 3339 UTC, when the engine knows it.
+    /// `None` (serialized `null`) means "unknown", which time filters treat
+    /// as not matching. `#[serde(default)]` keeps older cache entries
+    /// readable; the schema version bump invalidates them anyway.
+    #[serde(default)]
+    pub published: Option<String>,
 }
 
 /// One image search hit.
@@ -75,6 +81,14 @@ pub struct SearchOpts {
     /// Override for the FxTwitter API host (self-hosted FxTwitter instances).
     /// `None` means the public `https://api.fxtwitter.com` endpoint.
     pub fxtwitter_base_url: Option<String>,
+    /// FxTwitter result ordering: `latest` (default), `top` or `media`.
+    /// Ignored by every other engine.
+    pub feed: Option<String>,
+    /// Recency window, as written (`24h`, `2026-09-20`, ...). Raw strings on
+    /// purpose: resolving here would bake "now" into the cache key and every
+    /// relative bound would miss. Resolved at filter time instead.
+    pub since: Option<String>,
+    pub until: Option<String>,
     /// Shared minimum-interval limiter for every upstream request.
     pub pacer: Arc<Pacer>,
 }
@@ -89,6 +103,9 @@ impl Default for SearchOpts {
             api_user_agent: crate::config::api_user_agent(),
             contact_email: None,
             fxtwitter_base_url: None,
+            feed: None,
+            since: None,
+            until: None,
             pacer: Arc::new(Pacer::disabled()),
         }
     }

@@ -30,6 +30,8 @@ pub struct FeedEntry {
     pub author: String,
     /// `category@label` (Atom) or `category` text (RSS).
     pub category: String,
+    /// `pubDate` (RSS) or `published`/`updated` (Atom), raw as served.
+    pub published: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,7 @@ enum Field {
     Content,
     Author,
     Category,
+    Published,
 }
 
 /// Parse a feed body into entries.
@@ -208,6 +211,7 @@ fn commit(entry: &mut FeedEntry, field: Field, value: String) {
         Field::Summary | Field::Content => &mut entry.summary,
         Field::Author => &mut entry.author,
         Field::Category => &mut entry.category,
+        Field::Published => &mut entry.published,
     };
     // First non-empty value wins; `summary` set earlier is not clobbered by a
     // later `content` (and vice versa).
@@ -232,6 +236,9 @@ fn field_for(name: &str, parents: &[String]) -> Option<Field> {
                 _ => unreachable!(),
             })
         }
+        // Dates: RSS `<pubDate>`, Atom `<published>`/`<updated>`, Dublin
+        // Core `<dc:date>`. First non-empty value wins via `commit`.
+        "pubdate" | "published" | "updated" | "date" if in_item => Some(Field::Published),
         // RSS's `<dc:creator>Name</dc:creator>` is a leaf, unambiguous.
         "creator" if in_item => Some(Field::Author),
         "author" if parent == Some("item") => Some(Field::Author),

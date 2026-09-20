@@ -56,6 +56,8 @@ struct OaWork {
     #[serde(default)]
     publication_year: Option<i64>,
     #[serde(default)]
+    publication_date: Option<String>,
+    #[serde(default)]
     cited_by_count: Option<i64>,
     #[serde(default)]
     primary_location: Option<OaLoc>,
@@ -122,10 +124,20 @@ pub fn openalex_parse(body: &str) -> Result<Vec<SearchResult>> {
                 .cited_by_count
                 .map(|c| format!("cited {c}"))
                 .unwrap_or_default();
+            // Full date first, year-only fallback (January 1st).
+            let published = w
+                .publication_date
+                .as_deref()
+                .and_then(crate::time::normalize_iso)
+                .or_else(|| {
+                    w.publication_year
+                        .and_then(|y| crate::time::date_parts(&[y]))
+                });
             Some(SearchResult {
                 title: normalize_snippet(&strip_html(&title)),
                 url,
                 snippet: normalize_snippet(&join_meta(&[&year, &venue, &cited])),
+                published,
             })
         })
         .collect())
@@ -248,10 +260,16 @@ pub fn crossref_parse(body: &str) -> Result<Vec<SearchResult>> {
                 String::new()
             };
             let cited = format!("cited {}", w.citations);
+            let published = w.published.as_ref().and_then(|p| {
+                p.date_parts
+                    .first()
+                    .and_then(|d| crate::time::date_parts(d))
+            });
             Some(SearchResult {
                 title: normalize_snippet(&strip_html(&title)),
                 url,
                 snippet: normalize_snippet(&join_meta(&[&container, &year, &cited])),
+                published,
             })
         })
         .collect())
@@ -402,6 +420,7 @@ pub fn pubmed_parse(body: &str, ids: &[String]) -> Result<Vec<SearchResult>> {
                 title: normalize_snippet(&strip_html(&title)),
                 url: format!("https://pubmed.ncbi.nlm.nih.gov/{uid}/"),
                 snippet: normalize_snippet(&join_meta(&[source, pubdate])),
+                published: crate::time::pubmed_date(pubdate),
             })
         })
         .collect();
@@ -429,7 +448,10 @@ mod tests {
         assert_eq!(r[0].title, "On Async");
         assert_eq!(r[0].url, "https://doi.org/10.1/x");
         assert_eq!(r[0].snippet, "2021 · J. Systems · cited 7");
+        // Year-only work falls back to January 1st.
+        assert_eq!(r[0].published.as_deref(), Some("2021-01-01T00:00:00+00:00"));
         assert_eq!(r[1].url, "https://openalex.org/W2");
+        assert_eq!(r[1].published, None);
     }
 
     #[test]
@@ -441,6 +463,8 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].title, "ASYNC 2020");
         assert_eq!(r[0].snippet, "IEEE ASYNC · 2020 · cited 3");
+        // [2020, 5] resolves to the first of the month.
+        assert_eq!(r[0].published.as_deref(), Some("2020-05-01T00:00:00+00:00"));
     }
 
     #[test]
@@ -455,7 +479,9 @@ mod tests {
         assert_eq!(r[0].title, "First paper");
         assert_eq!(r[0].url, "https://pubmed.ncbi.nlm.nih.gov/1/");
         assert_eq!(r[0].snippet, "Nature · 2020 Jan");
+        assert_eq!(r[0].published.as_deref(), Some("2020-01-01T00:00:00+00:00"));
         assert_eq!(r[1].title, "Second paper");
+        assert_eq!(r[1].published.as_deref(), Some("2021-02-01T00:00:00+00:00"));
     }
 
     #[test]

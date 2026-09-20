@@ -59,6 +59,8 @@ struct Status {
     #[serde(default)]
     text: String,
     #[serde(default)]
+    created_at: String,
+    #[serde(default)]
     likes: f64,
     #[serde(default)]
     reposts: f64,
@@ -85,7 +87,8 @@ impl SearchEngine for FxTwitter {
         let query = checked_query(query)?;
         let endpoint = self.search_endpoint(opts)?;
         let count = opts.count.clamp(1, crate::cli::MAX_RESULTS).to_string();
-        let params: Vec<(&str, &str)> = vec![("q", query), ("feed", "latest"), ("count", &count)];
+        let feed = checked_feed(opts.feed.as_deref())?;
+        let params: Vec<(&str, &str)> = vec![("q", query), ("feed", feed), ("count", &count)];
         let url = Url::parse_with_params(&endpoint, &params)
             .map_err(|e| Error::Config(format!("bad URL construction: {e}")))?;
 
@@ -143,6 +146,19 @@ fn checked_query(query: &str) -> Result<&str> {
     Ok(query)
 }
 
+/// Resolve the `feed` ordering: unset/blank means `latest`, anything else
+/// must be a value the API accepts. Shared with CLI/recipe validation so a
+/// typo fails before any request is sent.
+pub(crate) fn checked_feed(feed: Option<&str>) -> Result<&str> {
+    match feed.map(str::trim) {
+        None | Some("") => Ok("latest"),
+        Some(valid @ ("latest" | "top" | "media")) => Ok(valid),
+        Some(other) => Err(Error::Config(format!(
+            "invalid fxtwitter feed '{other}' (expected latest, top or media)"
+        ))),
+    }
+}
+
 /// Pure parser (unit-tested against fixtures): JSON in, typed results out.
 pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
     let resp = serde_json::from_str::<SearchResp>(body)
@@ -172,6 +188,7 @@ fn map_results(items: Vec<Status>) -> Vec<SearchResult> {
                 title: normalize_snippet(&format!("@{}", author_handle(&s.author))),
                 url,
                 snippet: normalize_snippet(&join_meta(&[s.text.trim(), &meta])),
+                published: crate::time::x_created_at(&s.created_at),
             })
         })
         .collect()
@@ -211,7 +228,8 @@ mod tests {
 
     const FIXTURE: &str = r#"{"code":200,"results":[
       {"type":"status","id":"1234567890123456789","url":"https://twitter.com/alice/status/1234567890123456789",
-       "text":"Tokio 1.0 is out","likes":512,"reposts":44,"replies":12,
+       "text":"Tokio 1.0 is out","created_at":"Sun Sep 20 07:57:08 +0000 2026",
+       "likes":512,"reposts":44,"replies":12,
        "author":{"name":"Alice","screen_name":"alice"}},
       {"type":"status","id":"9876543210987654321","url":"",
        "text":"media-only post","likes":3,"reposts":0,"replies":1,
@@ -232,6 +250,8 @@ mod tests {
             r[0].snippet,
             "Tokio 1.0 is out · 512 likes · 44 reposts · 12 replies"
         );
+        assert_eq!(r[0].published.as_deref(), Some("2026-09-20T07:57:08+00:00"));
+        assert_eq!(r[1].published, None, "missing created_at stays unknown");
         // Missing URL + numeric id -> canonical x.com status link.
         assert_eq!(r[1].url, "https://x.com/i/status/9876543210987654321");
         assert_eq!(r[1].title, "@unknown");
@@ -294,6 +314,15 @@ mod tests {
                 "{bad} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn feed_defaults_to_latest_and_rejects_unknown() {
+        assert_eq!(checked_feed(None).unwrap(), "latest");
+        assert_eq!(checked_feed(Some("  ")).unwrap(), "latest");
+        assert_eq!(checked_feed(Some("top")).unwrap(), "top");
+        assert_eq!(checked_feed(Some("media")).unwrap(), "media");
+        assert!(checked_feed(Some("hot")).is_err());
     }
 
     #[test]

@@ -56,6 +56,8 @@ struct Crate {
     documentation: Option<String>,
     #[serde(default)]
     max_version: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 impl SearchEngine for Crates {
@@ -94,12 +96,14 @@ pub fn crates_parse(body: &str) -> Result<Vec<SearchResult>> {
             let desc = c.description.unwrap_or_default();
             let version = c.max_version.map(|v| format!("v{v}")).unwrap_or_default();
             let downloads = format!("{} downloads", c.downloads);
+            let published = c.updated_at.as_deref().and_then(crate::time::normalize_iso);
             SearchResult {
                 title: c.id,
                 // Registry descriptions are arbitrary user text: cap them or
                 // the documented ~300-char snippet bound is a fiction.
                 snippet: normalize_snippet(&join_meta(&[&desc, &version, &downloads])),
                 url,
+                published,
             }
         })
         .collect())
@@ -149,6 +153,8 @@ struct NpmPkg {
     description: Option<String>,
     #[serde(default)]
     links: Option<NpmLinks>,
+    #[serde(default)]
+    date: Option<String>,
 }
 #[derive(Deserialize)]
 struct NpmLinks {
@@ -204,10 +210,16 @@ pub fn npm_parse(body: &str) -> Result<Vec<SearchResult>> {
                 "{} downloads/mo",
                 o.downloads.and_then(|d| d.monthly).unwrap_or(0)
             );
+            let published = o
+                .package
+                .date
+                .as_deref()
+                .and_then(crate::time::normalize_iso);
             SearchResult {
                 title: o.package.name,
                 snippet: normalize_snippet(&join_meta(&[&desc, &version, &monthly])),
                 url,
+                published,
             }
         })
         .collect())
@@ -240,6 +252,13 @@ impl PyPi {
 #[derive(Deserialize)]
 struct PyPiResp {
     info: Option<PyPiInfo>,
+    #[serde(default)]
+    releases: std::collections::HashMap<String, Vec<PyPiFile>>,
+}
+#[derive(Deserialize)]
+struct PyPiFile {
+    #[serde(default)]
+    upload_time_iso_8601: Option<String>,
 }
 #[derive(Deserialize)]
 struct PyPiInfo {
@@ -310,10 +329,19 @@ pub fn pypi_parse(body: &str, name: &str) -> Result<Vec<SearchResult>> {
     };
     let summary = info.summary.unwrap_or_default();
     let version = info.version.map(|v| format!("v{v}")).unwrap_or_default();
+    // Latest upload across all releases: ISO strings sort chronologically.
+    let published = resp
+        .releases
+        .values()
+        .flatten()
+        .filter_map(|f| f.upload_time_iso_8601.as_deref())
+        .max()
+        .and_then(crate::time::normalize_iso);
     Ok(vec![SearchResult {
         title,
         url,
         snippet: normalize_snippet(&join_meta(&[&summary, &version])),
+        published,
     }])
 }
 

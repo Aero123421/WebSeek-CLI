@@ -115,6 +115,12 @@ webseek search "requests"         --engine pypi          # exact-name lookup
 webseek search "Tokyo"            --engine nominatim     # geocoding
 webseek search "rust"             --engine fxtwitter    # X/Twitter posts
 webseek search "@telegram"        --engine telegram     # public channel posts (query = channel)
+webseek search "@telegram proxy"  --engine telegram     # ... with in-channel keywords (?q=)
+
+# Recency: keep only results inside a time window (engines that know dates)
+webseek search "from:XDevelopers OR from:X" --engine fxtwitter --since 24h
+webseek search "rust async" --engine hackernews --since 7d --until 2026-09-20
+webseek search "rust" --engine fxtwitter --feed top   # latest (default) | top | media
 
 # Discover every engine and what it's for (machine-readable)
 webseek engines --json
@@ -209,17 +215,25 @@ A closed pipe is **not** an error: `webseek fetch … | head` exits `0`.
 
 ```json
 {"query":"rust","engine":"duckduckgo","count":5,"results":[
-  {"title":"...","url":"https://...","snippet":"..."}]}
+  {"title":"...","url":"https://...","snippet":"...","published":"2026-09-20T07:57:08+00:00"}]}
 ```
 
 `engine` is the engine that actually answered, which may differ from the one
 you asked for when fallback kicked in — including on a cache hit.
 
+`published` is the publication instant as RFC 3339 UTC when the engine knows
+it (`fxtwitter`, `telegram`, `hackernews`, `reddit`, `stackexchange`,
+`bing`, `openalex`, `crossref`, `pubmed`, `crates`, `npm`, `pypi`), else
+`null` for "unknown". `--since` / `--until` keep results inside
+`[since, until)` — bounds are durations (`30m`, `24h`, `7d`, `4w`) back from
+now, or absolute dates (`2026-09-20`, `2026-09-20T15:04:05Z`) — and undated
+results never match a set bound.
+
 `run` (combined from every step, no per-step envelope):
 
 ```json
 {"count":5,"results":[
-  {"title":"...","url":"https://...","snippet":"..."}]}
+  {"title":"...","url":"https://...","snippet":"...","published":"2026-09-20T07:57:08+00:00"}]}
 ```
 
 `fetch`:
@@ -318,20 +332,21 @@ output: {format: jsonl}
 - `version: 1` is required; steps run top to bottom.
 - Search steps take `engine`, `query`, and optional `count` (1..=50, default
   is config `max_results`), `lang`, `region`, `safe` (a step `safe: false`
-  overrides config `true`, like `--no-safe`). Step `lang`/`region` only reach
-  engines that read them; the Accept-Language header always comes from the
-  CLI/config `--lang`. Fetch steps take `urls` plus optional `max_chars`
-  (default is config `max_chars`, max 10M) and `jobs` (default 1).
-  A fetched page joins the list as a digest item (title + excerpt); full text
-  stays available through `fetch` itself.
+  overrides config `true`, like `--no-safe`), `since` / `until` (same shapes
+  as the CLI flags) and `feed` (`latest`/`top`/`media`, fxtwitter only).
+  Step `lang`/`region` only reach engines that read them; the Accept-Language
+  header always comes from the CLI/config `--lang`. Fetch steps take `urls`
+  plus optional `max_chars` (default is config `max_chars`, max 10M) and
+  `jobs` (default 1). A fetched page joins the list as a digest item
+  (title + excerpt); full text stays available through `fetch` itself.
 - `${var}` interpolates `vars` in any string value (`$$` escapes); a lone
   `${var}` keeps its type, so `count: "${n}"` works with `n: 10` (string
   fields also accept numbers, but numeric fields need numeric vars). Vars may
   reference other vars, one level. `${item}` exists only inside `for_each`
   (no nesting, max 1024 items and 1024 unrolled steps).
-- `combine` dedupes by URL, then stable-sorts (`sort: url|title`), then
-  truncates (`limit`, max 200). Without it, step results concatenate
-  untouched.
+- `combine` dedupes by URL, then stable-sorts (`sort: url|title|date`,
+  newest first with undated last for `date`), then truncates (`limit`, max
+  200). Without it, step results concatenate untouched.
 - `output.format` is `json`, `jsonl` or `pretty`. Precedence: an explicit CLI
   `--json` / `--jsonl` / `--pretty` flag, then the recipe, then auto (JSON
   when piped, pretty on a TTY) — except a file sink without any format,
@@ -353,7 +368,9 @@ output: {format: jsonl}
   or entries are dropped and refetched. Use `webseek cache info` / `cache clear`,
   `--no-cache` / `--cache`, or `cache_max_entries = 0`. Set
   `WEBSEEK_CACHE_DIR` to override the platform cache directory; webseek stores
-  `cache.json` and its lock file inside it.
+  `cache.json` and its lock file inside it. Relative `--since` bounds (`24h`)
+  resolve at request time; a cache hit reuses the window frozen when the
+  entry was stored, until TTL expiry.
 - **Automatic fallback.** If a **web** engine is rate-limited, errors, *or
   returns nothing*, webseek tries the remaining web engines and reports which
   one served the result. Empty results count as failure because a scraper whose

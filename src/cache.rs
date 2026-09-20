@@ -35,7 +35,9 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Bump when a change to extraction/serialization makes old entries wrong.
-pub const CACHE_SCHEMA_VERSION: u32 = 4;
+/// v5: `SearchResult` gained `published` (old entries would wrongly read as
+/// undated under time filters).
+pub const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// Injectable clock (unix seconds) so TTL tests need no sleeping.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -509,6 +511,10 @@ pub fn search_key(
         opts.region.as_deref().unwrap_or(""),
         &opts.safe.to_string(),
         opts.fxtwitter_base_url.as_deref().unwrap_or(""),
+        opts.feed.as_deref().unwrap_or(""),
+        // Written forms ("24h"), resolved at filter time — see SearchOpts.
+        opts.since.as_deref().unwrap_or(""),
+        opts.until.as_deref().unwrap_or(""),
         if fallback { "1" } else { "0" },
     ])
 }
@@ -742,6 +748,23 @@ mod tests {
                 true
             )
         );
+        // Time bounds change the answer, so they key the cache too.
+        for changed in [
+            crate::models::SearchOpts {
+                since: Some("24h".into()),
+                ..search.clone()
+            },
+            crate::models::SearchOpts {
+                until: Some("2026-09-20".into()),
+                ..search.clone()
+            },
+            crate::models::SearchOpts {
+                feed: Some("top".into()),
+                ..search.clone()
+            },
+        ] {
+            assert_ne!(base, search_key("bing", "q", &changed, true));
+        }
         // A self-hosted FxTwitter answers from a different index than the
         // public host, so the override must key the cache.
         let fx_base = search_key("fxtwitter", "q", &search, true);

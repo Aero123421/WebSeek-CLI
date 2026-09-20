@@ -102,6 +102,8 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
                 title: normalize_snippet(&title),
                 url: format!("https://www.openstreetmap.org/{}/{}", p.osm_type, p.osm_id),
                 snippet: normalize_snippet(&join_meta(&[&p.place_type, &coords])),
+                // Places have no publication date.
+                published: None,
             }
         })
         .collect())

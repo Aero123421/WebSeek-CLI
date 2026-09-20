@@ -126,6 +126,45 @@ fn runtime_errors_exit_1_with_a_readable_message() {
 }
 
 #[test]
+fn bad_time_bounds_and_feed_fail_before_any_request() {
+    // No mock mounted: validation runs before the first request, so these
+    // fail offline with exit 1 and a naming message.
+    Cli::new()
+        .cmd()
+        .args([
+            "search",
+            "x",
+            "--engine",
+            "hackernews",
+            "--since",
+            "someday",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("invalid --since 'someday'"));
+    Cli::new()
+        .cmd()
+        .args([
+            "search",
+            "x",
+            "--since",
+            "2026-09-20",
+            "--until",
+            "2026-09-19",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("window is empty"));
+    Cli::new()
+        .cmd()
+        .args(["search", "x", "--feed", "hot"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid fxtwitter feed 'hot'"));
+}
+
+#[test]
 fn unsupported_scheme_is_rejected_before_any_request() {
     Cli::new()
         .cmd()

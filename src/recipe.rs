@@ -71,6 +71,9 @@ pub enum Step {
         lang: Option<String>,
         region: Option<String>,
         safe: Option<bool>,
+        since: Option<String>,
+        until: Option<String>,
+        feed: Option<String>,
     },
     Fetch {
         step_no: usize,
@@ -94,6 +97,8 @@ pub struct Combine {
 pub enum SortKey {
     Url,
     Title,
+    /// Newest first by `published`; undated results sink last, stable.
+    Date,
 }
 
 /// Output sink. Absent: recipe-format-or-auto to stdout.
@@ -200,6 +205,12 @@ struct RawSearch {
     region: Option<String>,
     #[serde(default)]
     safe: Option<bool>,
+    #[serde(default, deserialize_with = "de_opt_coerce_string")]
+    since: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_coerce_string")]
+    until: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_coerce_string")]
+    feed: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -614,6 +625,17 @@ fn validate_step(step: SingleStep, step_no: usize) -> Result<Step> {
                     )));
                 }
             }
+            // Time bounds and feed fail here — before the first request —
+            // not as per-step runtime warnings.
+            crate::time::parse_window(s.since.as_deref(), s.until.as_deref(), "since", "until")
+                .map_err(|e| {
+                    Error::Config(format!("invalid recipe step {step_no}: {}", config_msg(e)))
+                })?;
+            if let Some(feed) = s.feed.as_deref() {
+                crate::engines::fxtwitter::checked_feed(Some(feed)).map_err(|e| {
+                    Error::Config(format!("invalid recipe step {step_no}: {}", config_msg(e)))
+                })?;
+            }
             Ok(Step::Search {
                 step_no,
                 engine: s.engine,
@@ -622,6 +644,9 @@ fn validate_step(step: SingleStep, step_no: usize) -> Result<Step> {
                 lang: s.lang,
                 region: s.region,
                 safe: s.safe,
+                since: s.since,
+                until: s.until,
+                feed: s.feed,
             })
         }
         SingleStep::Fetch(f) => {
@@ -660,6 +685,15 @@ fn unknown_engine_msg(name: &str) -> String {
     format!("unknown engine '{name}' (run `webseek engines` to list all)")
 }
 
+/// The message inside an [`Error::Config`], without its Display prefix — for
+/// re-wrapping with step context instead of doubling "configuration error".
+fn config_msg(e: Error) -> String {
+    match e {
+        Error::Config(m) => m,
+        other => other.to_string(),
+    }
+}
+
 fn parse_combine(
     mapping: &serde_yaml::Mapping,
     vars: &HashMap<String, serde_yaml::Value>,
@@ -692,8 +726,9 @@ fn parse_combine(
         .map(|s| match s {
             "url" => Ok(SortKey::Url),
             "title" => Ok(SortKey::Title),
+            "date" => Ok(SortKey::Date),
             other => Err(Error::Config(format!(
-                "invalid recipe combine: sort must be 'url' or 'title' (got '{other}')"
+                "invalid recipe combine: sort must be 'url', 'title' or 'date' (got '{other}')"
             ))),
         })
         .transpose()?;
@@ -762,6 +797,10 @@ pub fn combine_results(
     match combine.sort {
         Some(SortKey::Url) => results.sort_by(|a, b| a.url.cmp(&b.url)),
         Some(SortKey::Title) => results.sort_by(|a, b| a.title.cmp(&b.title)),
+        // Stable: ties (including undated) keep step order.
+        Some(SortKey::Date) => results.sort_by(|a, b| {
+            crate::time::compare_date_desc(a, b).unwrap_or(std::cmp::Ordering::Equal)
+        }),
         None => {}
     }
     if let Some(limit) = combine.limit {
@@ -795,6 +834,8 @@ pub fn map_fetch(fetch: &FetchResult) -> SearchResult {
         title: crate::text::normalize_snippet(fetch.title.as_deref().unwrap_or(fetch.url.as_str())),
         url: fetch.url.clone(),
         snippet: crate::text::normalize_snippet(&fetch.text),
+        // A fetched page carries no publication instant of its own.
+        published: None,
     }
 }
 
@@ -922,7 +963,7 @@ output: {format: jsonl, file: ./out.jsonl}
             "version: 1\nsteps:\n  - search: {engine: reddit, query: y}\ncombine: {limit: 201}\n";
         assert!(parse(bad_limit).unwrap_err().to_string().contains("limit"));
         let bad_sort =
-            "version: 1\nsteps:\n  - search: {engine: reddit, query: y}\ncombine: {sort: date}\n";
+            "version: 1\nsteps:\n  - search: {engine: reddit, query: y}\ncombine: {sort: bogus}\n";
         assert!(parse(bad_sort).unwrap_err().to_string().contains("sort"));
         let bad_dedupe = "version: 1\nsteps:\n  - search: {engine: reddit, query: y}\ncombine: {dedupe_by: title}\n";
         assert!(parse(bad_dedupe)
@@ -1033,7 +1074,96 @@ output: {format: jsonl, file: ./out.jsonl}
             title: title.into(),
             url: url.into(),
             snippet: String::new(),
+            published: None,
         }
+    }
+
+    #[test]
+    fn search_steps_accept_time_bounds_and_feed() {
+        let r = parse(
+            "version: 1\nsteps:\n  - search: {engine: fxtwitter, query: y, since: 24h, until: 2026-09-20, feed: top}\n",
+        )
+        .unwrap();
+        match &r.steps[0] {
+            Step::Search {
+                since, until, feed, ..
+            } => {
+                assert_eq!(since.as_deref(), Some("24h"));
+                assert_eq!(until.as_deref(), Some("2026-09-20"));
+                assert_eq!(feed.as_deref(), Some("top"));
+            }
+            _ => panic!("must be a search"),
+        }
+        // Bad bounds and feed fail at parse time, naming the step.
+        for bad in [
+            "version: 1\nsteps:\n  - search: {engine: x, query: y, since: someday}\n",
+            "version: 1\nsteps:\n  - search: {engine: x, query: y, until: 24x}\n",
+            "version: 1\nsteps:\n  - search: {engine: x, query: y, feed: hot}\n",
+            "version: 1\nsteps:\n  - search: {engine: x, query: y, since: 2026-09-20, until: 2026-09-19}\n",
+        ] {
+            let err = parse(bad).unwrap_err().to_string();
+            assert!(err.contains("step 1"), "got: {err}");
+            assert_eq!(
+                err.matches("configuration error").count(),
+                1,
+                "kind prefix must not double, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_date_orders_newest_first_with_undated_last() {
+        let dated = |url: &str, published: Option<&str>| SearchResult {
+            title: url.into(),
+            url: url.into(),
+            snippet: String::new(),
+            published: published.map(str::to_string),
+        };
+        let results = vec![
+            dated("https://x/old", Some("2020-01-01T00:00:00+00:00")),
+            dated("https://x/none", None),
+            dated("https://x/new", Some("2026-09-20T00:00:00+00:00")),
+        ];
+        let combined = combine_results(
+            results,
+            &Some(Combine {
+                dedupe: false,
+                sort: Some(SortKey::Date),
+                limit: None,
+            }),
+        );
+        let urls: Vec<_> = combined.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, ["https://x/new", "https://x/old", "https://x/none"]);
+    }
+
+    #[test]
+    fn sort_date_is_stable_on_ties() {
+        let dated = |url: &str, published: Option<&str>| SearchResult {
+            title: url.into(),
+            url: url.into(),
+            snippet: String::new(),
+            published: published.map(str::to_string),
+        };
+        // Same instant twice plus an undated twin: step order survives.
+        let results = vec![
+            dated("https://x/a", Some("2026-09-20T00:00:00+00:00")),
+            dated("https://x/b", Some("2026-09-20T00:00:00+00:00")),
+            dated("https://x/u1", None),
+            dated("https://x/u2", None),
+        ];
+        let combined = combine_results(
+            results,
+            &Some(Combine {
+                dedupe: false,
+                sort: Some(SortKey::Date),
+                limit: None,
+            }),
+        );
+        let urls: Vec<_> = combined.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://x/a", "https://x/b", "https://x/u1", "https://x/u2"]
+        );
     }
 
     #[test]

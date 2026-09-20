@@ -18,6 +18,7 @@ pub mod recipe;
 pub mod region;
 pub mod robots;
 pub mod text;
+pub mod time;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -240,6 +241,10 @@ impl Ctx<'_> {
             }),
             contact_email: self.cfg.contact_email.clone(),
             fxtwitter_base_url: self.cfg.fxtwitter_base_url.clone(),
+            // Callers set these afterwards (CLI flags / recipe step fields).
+            feed: None,
+            since: None,
+            until: None,
             pacer: self.pacer.clone(),
         }
     }
@@ -273,10 +278,22 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             region,
             safe,
             no_safe,
+            since,
+            until,
+            feed,
             open,
         } => {
             let name = engine.as_deref().unwrap_or(&ctx.cfg.engine);
-            let opts = ctx.search_opts(*count, lang, region, *safe, *no_safe);
+            // Validate time bounds and feed before any request, so a typo
+            // fails fast instead of after a slow upstream round trip.
+            crate::time::parse_window(since.as_deref(), until.as_deref(), "--since", "--until")?;
+            if let Some(f) = feed {
+                crate::engines::fxtwitter::checked_feed(Some(f))?;
+            }
+            let mut opts = ctx.search_opts(*count, lang, region, *safe, *no_safe);
+            opts.since.clone_from(since);
+            opts.until.clone_from(until);
+            opts.feed.clone_from(feed);
             ctx.trace(&format!("searching '{query}' via {name}"));
 
             let (results, engine_used) = search_with_cache(ctx, name, query, &opts)?;
@@ -465,17 +482,24 @@ fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult
                 lang,
                 region,
                 safe,
+                since,
+                until,
+                feed,
                 ..
             } => {
                 // `safe: false` in a step overrides a config `true`, exactly
                 // like `--no-safe` on the command line.
-                let opts = ctx.search_opts(
+                let mut opts = ctx.search_opts(
                     *count,
                     lang,
                     region,
                     safe.unwrap_or(false),
                     *safe == Some(false),
                 );
+                // Bounds and feed were validated at parse time.
+                opts.since.clone_from(since);
+                opts.until.clone_from(until);
+                opts.feed.clone_from(feed);
                 if ctx.cli.verbose {
                     output::note(&format!("step {n}/{total}: search '{query}' via {engine}"));
                 }
@@ -642,6 +666,26 @@ fn search_with_cache(
         eng.search(ctx.client, query, opts).map(|r| (r, eng.name()))
     })?;
 
+    // Recency window: relative bounds resolve here, at request time, so the
+    // cache key above can hold the stable written form ("24h", not an
+    // instant). Both callers validated already; re-parse defensively.
+    let (since, until) = crate::time::parse_window(
+        opts.since.as_deref(),
+        opts.until.as_deref(),
+        "--since",
+        "--until",
+    )?;
+    let total = results.len();
+    let (results, undated) = crate::time::filter_by_time(results, since, until);
+    if since.is_some() || until.is_some() {
+        let outside = total.saturating_sub(results.len()).saturating_sub(undated);
+        ctx.trace(&format!(
+            "time window kept {}/{} result(s) ({outside} outside, {undated} undated)",
+            results.len(),
+            total
+        ));
+    }
+
     store(ctx, key, engine_used, &results);
     Ok((results, engine_used))
 }
@@ -753,6 +797,7 @@ mod tests {
 
     fn hit(url: &str) -> SearchResult {
         SearchResult {
+            published: None,
             title: "t".into(),
             url: url.into(),
             snippet: String::new(),

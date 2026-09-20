@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every search hit now carries `published` (RFC 3339 UTC, or `null` when the
+  engine cannot say) on the twelve engines whose upstreams expose a date:
+  `fxtwitter`, `telegram`, `hackernews`, `reddit`, `stackexchange`, `bing`
+  (RSS), `openalex`, `crossref`, `pubmed`, `crates`, `npm` and `pypi`.
+  Pretty output shows the calendar day; JSON carries the full instant.
+- New `--since` / `--until` search flags (durations like `24h` back from now,
+  or absolute `2026-09-20` / RFC 3339 dates) keeping results inside
+  `[since, until)`. Undated results never match a set bound; inverted or
+  equal bounds fail naming both. Bounds are part of the cache key in their
+  written form. `hackernews` and `stackexchange` push the window to their
+  APIs (`numericFilters`, `fromdate`/`todate`), so the count cutoff applies
+  to in-window hits instead of relevance order.
+- New `--feed` search flag (`latest`/`top`/`media`) for the `fxtwitter`
+  engine; X operators such as `from:A OR from:B` pass through, so
+  `webseek search "from:A OR from:B" --engine fxtwitter --since 24h` watches
+  several accounts' posts and replies at once.
+- The `telegram` engine searches within a channel: trailing keywords
+  (`@name rust async`) are sent as `?q=`. Server-side, like `?before=`
+  paging — not a client-side substring match.
+- Recipe search steps accept `since`, `until` and `feed`, validated before
+  the first request; `combine` accepts `sort: date` (newest first, undated
+  last, stable).
+
+### Changed
+
+- Telegram titles are the bare `@channel` again; the date moved to
+  `published` (shown in pretty output).
+- `combine.sort` rejects anything but `url`, `title` or `date`.
+
 ## [0.5.0] - 2026-09-20
 
 ### Added

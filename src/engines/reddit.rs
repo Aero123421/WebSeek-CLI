@@ -82,6 +82,7 @@ pub fn parse_results(body: &str) -> Result<Vec<SearchResult>> {
                     &author,
                     &strip_html(&entry.summary),
                 ])),
+                published: crate::time::feed_date(&entry.published),
             })
         })
         .collect())
