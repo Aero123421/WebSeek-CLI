@@ -72,6 +72,9 @@ pub struct SearchOpts {
     /// Contact address for APIs with a "polite pool" (OpenAlex, NCBI).
     /// `None` means webseek makes no claim about who is calling.
     pub contact_email: Option<String>,
+    /// Override for the FxTwitter API host (self-hosted FxTwitter instances).
+    /// `None` means the public `https://api.fxtwitter.com` endpoint.
+    pub fxtwitter_base_url: Option<String>,
     /// Shared minimum-interval limiter for every upstream request.
     pub pacer: Arc<Pacer>,
 }
@@ -85,6 +88,7 @@ impl Default for SearchOpts {
             safe: false,
             api_user_agent: crate::config::api_user_agent(),
             contact_email: None,
+            fxtwitter_base_url: None,
             pacer: Arc::new(Pacer::disabled()),
         }
     }

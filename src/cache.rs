@@ -508,6 +508,7 @@ pub fn search_key(
         opts.lang.as_deref().unwrap_or(""),
         opts.region.as_deref().unwrap_or(""),
         &opts.safe.to_string(),
+        opts.fxtwitter_base_url.as_deref().unwrap_or(""),
         if fallback { "1" } else { "0" },
     ])
 }
@@ -736,6 +737,21 @@ mod tests {
                 "q",
                 &crate::models::SearchOpts {
                     lang: Some("ja".into()),
+                    ..search.clone()
+                },
+                true
+            )
+        );
+        // A self-hosted FxTwitter answers from a different index than the
+        // public host, so the override must key the cache.
+        let fx_base = search_key("fxtwitter", "q", &search, true);
+        assert_ne!(
+            fx_base,
+            search_key(
+                "fxtwitter",
+                "q",
+                &crate::models::SearchOpts {
+                    fxtwitter_base_url: Some("https://fx.example.com".into()),
                     ..search.clone()
                 },
                 true

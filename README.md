@@ -113,6 +113,8 @@ webseek search "immunotherapy"    --engine pubmed
 webseek search "async"            --engine crates        # also: npm
 webseek search "requests"         --engine pypi          # exact-name lookup
 webseek search "Tokyo"            --engine nominatim     # geocoding
+webseek search "rust"             --engine fxtwitter    # X/Twitter posts
+webseek search "@telegram"        --engine telegram     # public channel posts (query = channel)
 
 # Discover every engine and what it's for (machine-readable)
 webseek engines --json
@@ -363,6 +365,7 @@ allow_proxy = true        # use configured HTTP(S) proxies
 # contact_email = "you@example.com"  # see "Engines & ethics"
 # lang = "ja"                        # engine-dependent
 # region = "jp"                      # flexible: "jp", "en-us", "EN_US"
+# fxtwitter_base_url = "https://fx.example.com"  # self-hosted FxTwitter API host
 ```
 
 This block is exactly what `webseek init` writes, and it parses as-is.
@@ -405,12 +408,14 @@ for its domain, not a replacement for general web search.
 | `npm` | | npm registry | JS package keyword search |
 | `pypi` | | PyPI JSON API | Python package lookup (exact name) |
 | `nominatim` | `osm` | OpenStreetMap Nominatim | Geocoding / places |
+| `fxtwitter` | `fx`, `x` | FxTwitter API v2 | X/Twitter posts (`fxtwitter_base_url` = self-host) |
+| `telegram` | `tg` | t.me public preview | Public channel posts (query = channel) |
 
 ### How webseek identifies itself
 
-Scraped endpoints (DuckDuckGo, Bing, image search) receive a browser-like
-User-Agent, because they serve challenge pages to anything that looks
-automated. **Official APIs receive the truth**: `webseek/<version>` with a link
+Scraped endpoints (DuckDuckGo, Bing, image search, Telegram previews)
+receive a browser-like User-Agent, because they serve challenge pages to
+anything that looks automated. **Official APIs receive the truth**: `webseek/<version>` with a link
 to this repository. Nominatim, crates.io and NCBI all ask for this in their
 usage policies — Nominatim explicitly blocks browser impersonation — so
 pretending to be Chrome there was both against their terms and worse for us.
@@ -424,7 +429,11 @@ Set `contact_email` in your config to be a better citizen still:
   sends `tool=webseek`, and `email` when configured.
 
 Notes: PyPI has **no** keyword-search API (its HTML search is bot-protected), so
-`pypi` is an exact-name lookup. All stable sources still honor the global delay
+`pypi` is an exact-name lookup. FxTwitter defaults to the public
+`api.fxtwitter.com` host (1000 req/min per IP); set `fxtwitter_base_url` to use
+a self-hosted instance. `telegram` has no cross-channel search — the query
+names one public channel, and private channels/groups need authenticated API
+access, so they are out of scope. All stable sources still honor the global delay
 and benefit from the cache.
 
 The scraped endpoints can change or block aggressive use. webseek's engine layer
@@ -452,7 +461,8 @@ src/
   config.rs     config.toml loading / writing, user-agent policy
   engines/      SearchEngine + ImageEngine traits and the engine registry;
                 web (DDG/Bing) + stable sources (wikipedia, hackernews,
-                reddit, stackexchange, academic, packages, nominatim)
+                reddit, fxtwitter, telegram, stackexchange, academic,
+                packages, nominatim)
   error.rs      typed errors with stable exit-code + `kind` semantics
   feed.rs       namespace-aware RSS / Atom parsing
   http.rs       browser headers + retry with backoff/jitter (transport layer)

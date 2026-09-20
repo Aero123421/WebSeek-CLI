@@ -233,11 +233,12 @@ impl Ctx<'_> {
             },
             // `--ua` overrides the API agent too. The flag says "override the
             // User-Agent header"; honouring it on scraped endpoints only would
-            // silently make it a no-op for eleven of the thirteen engines.
+            // silently make it a no-op for thirteen of the fifteen engines.
             api_user_agent: self.cli.ua.clone().unwrap_or_else(|| {
                 config::api_user_agent_with_contact(self.cfg.contact_email.as_deref())
             }),
             contact_email: self.cfg.contact_email.clone(),
+            fxtwitter_base_url: self.cfg.fxtwitter_base_url.clone(),
             pacer: self.pacer.clone(),
         }
     }
