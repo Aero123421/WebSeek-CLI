@@ -14,6 +14,7 @@ pub mod net;
 pub mod output;
 pub mod pace;
 pub mod reader;
+pub mod recipe;
 pub mod region;
 pub mod robots;
 pub mod text;
@@ -403,7 +404,136 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             write_images(ctx.mode, query, engine_used, &results, downloaded)?;
             Ok(())
         }
+
+        Command::Run { file } => {
+            let recipe = recipe::parse(&recipe::read_recipe(file)?)?;
+            // An explicit CLI format flag wins over the recipe, mirroring the
+            // config philosophy; a file sink without any format defaults to
+            // JSON (there is no TTY to auto-detect from).
+            let explicit = ctx.cli.json || ctx.cli.jsonl || ctx.cli.pretty;
+            let out_mode = if explicit {
+                ctx.mode
+            } else if let Some(format) = recipe.output.as_ref().and_then(|o| o.format) {
+                format.mode()
+            } else if recipe.output.as_ref().is_some_and(|o| o.file.is_some()) {
+                Mode::Json
+            } else {
+                ctx.mode
+            };
+            let results = run_recipe(ctx, &recipe)?;
+            let combined = recipe::combine_results(results, &recipe.combine);
+            if let Some(path) = recipe.output.as_ref().and_then(|o| o.file.as_ref()) {
+                recipe::check_sink_writable(path)?;
+                let mut buf = Vec::new();
+                output::write_run_to(&mut buf, out_mode, &combined, recipe.steps.len())?;
+                std::fs::write(path, buf)
+                    .map_err(|e| Error::Config(format!("cannot write {}: {e}", path.display())))?;
+                output::note(&format!(
+                    "wrote {} result(s) to {}",
+                    combined.len(),
+                    path.display()
+                ));
+            } else {
+                output::write_run(out_mode, &combined, recipe.steps.len())?;
+            }
+            Ok(())
+        }
     }
+}
+
+/// Execute recipe steps in order, reusing the same search/fetch paths (and
+/// therefore cache, fallback, pacing and egress policy) as the CLI arms.
+///
+/// A failing step warns and the run continues with the rest; only an
+/// all-steps-failed run is an error. Empty results are success, as everywhere.
+fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult>> {
+    let total = recipe.steps.len();
+    let mut out = Vec::new();
+    let mut failed = 0usize;
+    let mut last_err = String::new();
+    for step in recipe.steps.iter() {
+        // Origin numbers, not unrolled positions: warnings must name the step
+        // the user wrote, matching validation errors.
+        let n = match step {
+            recipe::Step::Search { step_no, .. } | recipe::Step::Fetch { step_no, .. } => *step_no,
+        };
+        match step {
+            recipe::Step::Search {
+                engine,
+                query,
+                count,
+                lang,
+                region,
+                safe,
+                ..
+            } => {
+                // `safe: false` in a step overrides a config `true`, exactly
+                // like `--no-safe` on the command line.
+                let opts = ctx.search_opts(
+                    *count,
+                    lang,
+                    region,
+                    safe.unwrap_or(false),
+                    *safe == Some(false),
+                );
+                if ctx.cli.verbose {
+                    output::note(&format!("step {n}/{total}: search '{query}' via {engine}"));
+                }
+                match search_with_cache(ctx, engine, query, &opts) {
+                    Ok((results, _)) => out.extend(results),
+                    Err(e) => {
+                        failed += 1;
+                        last_err = format!("step {n} ({engine}): {e:#}");
+                        output::warn(&format!("step {n} failed ({engine}): {e:#}"));
+                    }
+                }
+            }
+            recipe::Step::Fetch {
+                urls,
+                max_chars,
+                jobs,
+                ..
+            } => {
+                let fetch_opts = FetchOpts {
+                    max_bytes: reader::DEFAULT_MAX_BYTES,
+                    max_chars: max_chars.unwrap_or(ctx.cfg.max_chars).max(1),
+                    raw_html: false,
+                    markdown: false,
+                };
+                let batch_ctx = BatchCtx {
+                    client: ctx.client,
+                    opts: &fetch_opts,
+                    cache: ctx.cache,
+                    robots: ctx.robots,
+                    pacer: ctx.pacer,
+                    respect_robots: ctx.cli.respect_robots(ctx.cfg.respect_robots),
+                    policy: ctx.policy,
+                };
+                if ctx.cli.verbose {
+                    output::note(&format!("step {n}/{total}: fetch {} URL(s)", urls.len()));
+                }
+                let items = batch::fetch_many(&batch_ctx, urls, jobs.unwrap_or(1));
+                let mut step_failed = 0usize;
+                for item in &items {
+                    match item {
+                        BatchItem::Ok(fetched) => out.push(recipe::map_fetch(fetched)),
+                        BatchItem::Err { url, error, kind } => {
+                            step_failed += 1;
+                            output::warn(&format!("step {n}: {url}: {error} ({kind})"));
+                        }
+                    }
+                }
+                if !items.is_empty() && step_failed == items.len() {
+                    failed += 1;
+                    last_err = format!("step {n}: all {} URL(s) failed", urls.len());
+                }
+            }
+        }
+    }
+    if failed == total {
+        anyhow::bail!("recipe failed: all {total} step(s) failed (last: {last_err})");
+    }
+    Ok(out)
 }
 
 fn open_result_url(raw: &str, allow_external_schemes: bool) -> error::Result<()> {
