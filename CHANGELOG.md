@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bump transitive `rustls` to 0.23.45 (`RUSTSEC-2026-0285`, TLS 1.3 handshake
+  messages accepted across encryption level boundaries).
+
 ### Added
 
 - New `fxtwitter` engine (aliases `fx`, `x`): X/Twitter post search via the
