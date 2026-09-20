@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `run` subcommand: executes a YAML recipe (`webseek run flow.yaml`, or
+  `-` for stdin) of `search`/`fetch` steps with `vars` interpolation,
+  `for_each` unrolling, `combine` (dedupe/sort/limit) and `output`
+  (format/file sink). Steps reuse the CLI's cache, fallback, pacing and
+  egress policy; a failing step warns and the run continues, and only an
+  all-steps-failed run exits 1.
+
+### Changed
+
+- `--help` now shows usage examples, enumerates every `--engine` value with
+  its web/vertical kind (drift-tested against the registry), documents which
+  engines honor `--lang`/`--region`/`--safe`, and groups global flags under
+  their own heading.
+
 ## [0.4.0] - 2026-09-20
 
 ### Fixed

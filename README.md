@@ -129,6 +129,9 @@ webseek config path
 # Inspect or clear the cache
 webseek cache info
 webseek cache clear
+
+# Run a multi-step YAML recipe
+webseek run flow.yaml
 ```
 
 ## Trust model
@@ -212,6 +215,13 @@ A closed pipe is **not** an error: `webseek fetch … | head` exits `0`.
 `engine` is the engine that actually answered, which may differ from the one
 you asked for when fallback kicked in — including on a cache hit.
 
+`run` (combined from every step, no per-step envelope):
+
+```json
+{"count":5,"results":[
+  {"title":"...","url":"https://...","snippet":"..."}]}
+```
+
 `fetch`:
 
 ```json
@@ -281,6 +291,58 @@ webseek search "2026 LLM survey" --count 8 --json \
 Set `delay_ms = 0` for speed against endpoints that tolerate it, or `300`+ for
 normal use. Note that the delay applies *between* requests inside one run; it
 cannot pace separate processes, so add your own `sleep` if you loop in a shell.
+
+### Recipes (`webseek run`)
+
+A recipe runs many searches and fetches in one invocation and merges them
+into one result list — one process, so pacing, cache and egress policy apply
+to every step:
+
+```sh
+webseek run flow.yaml
+cat flow.yaml | webseek run -
+```
+
+```yaml
+version: 1
+vars:
+  theme: "rust async"
+steps:
+  - search: {engine: fxtwitter, query: "${theme}", count: 10}
+  - for_each: {items: ["@telegram", "@rustlang"], do: {search: {engine: telegram, query: "${item}"}}}
+  - fetch: {urls: ["https://example.com/article"]}
+combine: {dedupe_by: url, limit: 20}
+output: {format: jsonl}
+```
+
+- `version: 1` is required; steps run top to bottom.
+- Search steps take `engine`, `query`, and optional `count` (1..=50, default
+  is config `max_results`), `lang`, `region`, `safe` (a step `safe: false`
+  overrides config `true`, like `--no-safe`). Step `lang`/`region` only reach
+  engines that read them; the Accept-Language header always comes from the
+  CLI/config `--lang`. Fetch steps take `urls` plus optional `max_chars`
+  (default is config `max_chars`, max 10M) and `jobs` (default 1).
+  A fetched page joins the list as a digest item (title + excerpt); full text
+  stays available through `fetch` itself.
+- `${var}` interpolates `vars` in any string value (`$$` escapes); a lone
+  `${var}` keeps its type, so `count: "${n}"` works with `n: 10` (string
+  fields also accept numbers, but numeric fields need numeric vars). Vars may
+  reference other vars, one level. `${item}` exists only inside `for_each`
+  (no nesting, max 1024 items and 1024 unrolled steps).
+- `combine` dedupes by URL, then stable-sorts (`sort: url|title`), then
+  truncates (`limit`, max 200). Without it, step results concatenate
+  untouched.
+- `output.format` is `json`, `jsonl` or `pretty`. Precedence: an explicit CLI
+  `--json` / `--jsonl` / `--pretty` flag, then the recipe, then auto (JSON
+  when piped, pretty on a TTY) — except a file sink without any format,
+  which is always JSON. `output.file` writes there (relative to the current
+  directory) instead of stdout and prints nothing to stdout; it truncates an
+  existing regular file, never creates parent directories, and refuses
+  symlinks.
+- A failing step warns on stderr and the run continues; only an
+  all-steps-failed run exits 1. Failed fetch URLs are skipped the same way
+  (use `fetch` itself for per-URL errors). Unknown keys and bad values fail
+  up front, before any request is sent. Recipes are capped at 256 KiB.
 
 ## Reliability
 
@@ -471,6 +533,7 @@ src/
   output.rs     JSON / JSONL / pretty writers (data-only stdout)
   pace.rs       shared minimum-interval limiter
   reader.rs     fetch + charset decoding + readability-lite extraction
+  recipe.rs     YAML recipe parsing + combining (`webseek run`)
   batch.rs      parallel multi-URL fetch with per-item error isolation
   cache.rs      locked on-disk LRU+TTL cache with count/byte budgets
   net.rs        URL, redirect and DNS egress policy
@@ -483,6 +546,7 @@ tests/
   engines.rs    web-engine integration tests against a local mock server
   verticals.rs  stable-source engine integration tests (wiremock)
   batch.rs      batch-fetch, pacing and robots.txt integration tests
+  run.rs        `webseek run` end-to-end tests (binary + mock servers)
 ```
 
 ## Releases

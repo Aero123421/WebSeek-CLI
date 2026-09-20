@@ -306,6 +306,57 @@ pub fn write_fetch_batch_to(
 }
 
 /// Engine catalog output (for `webseek engines`).
+/// A fully-formed JSON document written by `run`.
+#[derive(Serialize)]
+struct RunDoc<'a> {
+    count: usize,
+    results: &'a [SearchResult],
+}
+
+/// Recipe output: one combined result list, whatever the steps were.
+pub fn write_run(mode: Mode, results: &[SearchResult], steps: usize) -> std::io::Result<()> {
+    let out = std::io::stdout();
+    write_run_to(&mut out.lock(), mode, results, steps)
+}
+
+pub fn write_run_to(
+    w: &mut impl Write,
+    mode: Mode,
+    results: &[SearchResult],
+    steps: usize,
+) -> std::io::Result<()> {
+    match mode {
+        Mode::Json => {
+            let doc = RunDoc {
+                count: results.len(),
+                results,
+            };
+            writeln!(w, "{}", serde_json::to_string(&doc)?)?;
+        }
+        Mode::Jsonl => {
+            for r in results {
+                writeln!(w, "{}", serde_json::to_string(r)?)?;
+            }
+        }
+        Mode::Pretty => {
+            if results.is_empty() {
+                writeln!(w, "No results from {steps} recipe step(s).")?;
+                return Ok(());
+            }
+            for (i, r) in results.iter().enumerate() {
+                let title = sanitize_line(&r.title);
+                let url = sanitize_line(&r.url);
+                writeln!(w, "{}", paint(&format!("{:>2}. {title}", i + 1), "1"))?;
+                writeln!(w, "     {}", paint(&url, "36"))?;
+                if !r.snippet.is_empty() {
+                    writeln!(w, "     {}", sanitize_line(&r.snippet))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn write_engines(mode: Mode, engines: &[EngineInfo]) -> std::io::Result<()> {
     let out = std::io::stdout();
     write_engines_to(&mut out.lock(), mode, engines)
@@ -427,6 +478,35 @@ mod tests {
             url: "https://example.com".into(),
             snippet: "S".into(),
         }
+    }
+
+    #[test]
+    fn run_output_contract_is_count_plus_results() {
+        let results = vec![sample_search(), sample_search()];
+        let mut buf = Vec::new();
+        write_run_to(&mut buf, Mode::Json, &results, 3).unwrap();
+        let doc: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(doc["count"], json!(2));
+        assert_eq!(doc["results"].as_array().unwrap().len(), 2);
+
+        buf.clear();
+        write_run_to(&mut buf, Mode::Jsonl, &results, 3).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        for line in text.lines() {
+            assert!(serde_json::from_str::<Value>(line).unwrap().is_object());
+        }
+    }
+
+    #[test]
+    fn run_pretty_reports_step_count_when_empty() {
+        set_color(ColorChoice::Never);
+        let mut buf = Vec::new();
+        write_run_to(&mut buf, Mode::Pretty, &[], 4).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "No results from 4 recipe step(s).\n"
+        );
     }
 
     #[test]
