@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `fxtwitter` engine (aliases `fx`, `x`): X/Twitter post search via the
+  FxTwitter API v2, no key. `fxtwitter_base_url` points the engine at a
+  self-hosted host instead of the public `api.fxtwitter.com`; search cache
+  keys include the override. A no-match search answers HTTP 200 with empty
+  results, so an HTTP 404 surfaces as an error (timeline down) rather than a
+  confident empty answer.
+- New `telegram` engine (alias `tg`): public channel posts via `t.me/s/<ch>`,
+  no key and no login. The query is a channel (`@name`, `name`, or a `t.me/`
+  link); history is walked with `?before=` up to the requested count.
+  Unknown-or-private channels report `no_results`, since the two are
+  indistinguishable without authentication.
+
 ## [0.3.1] - 2026-09-14
 
 ### Fixed

@@ -5,15 +5,17 @@
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use webseek::engines::academic::{CrossRef, OpenAlex, PubMed};
+use webseek::engines::fxtwitter::FxTwitter;
 use webseek::engines::hackernews::HackerNews;
 use webseek::engines::nominatim::Nominatim;
 use webseek::engines::packages::{Crates, Npm, PyPi};
 use webseek::engines::reddit::Reddit;
 use webseek::engines::stackexchange::StackExchange;
+use webseek::engines::telegram::Telegram;
 use webseek::engines::wikipedia::Wikipedia;
 use webseek::engines::SearchEngine;
 use webseek::models::SearchOpts;
@@ -224,6 +226,160 @@ fn stackexchange_and_nominatim_full_pipeline() {
     let r = geo.search(&client(), "town", &opts()).unwrap();
     assert_eq!(r[0].title, "Town");
     assert_eq!(r[0].url, "https://www.openstreetmap.org/node/1");
+}
+
+#[test]
+fn fxtwitter_engine_full_pipeline() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":200,"results":[
+                  {"id":"1234567890123456789","url":"https://twitter.com/alice/status/1234567890123456789",
+                   "text":"Tokio 1.0","likes":512,"reposts":44,"replies":12,
+                   "author":{"name":"Alice","screen_name":"alice"}},
+                  {"id":"9876543210987654321","url":"","text":"second","likes":1,"reposts":0,"replies":0}
+                ],"cursor":{"top":null,"bottom":"x"}}"#,
+            ))
+            .mount(&server)
+            .await;
+    });
+    let engine = FxTwitter::with_base(format!("{}/2/search", server.uri()));
+    let r = engine.search(&client(), "tokio", &opts()).unwrap();
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].title, "@alice");
+    assert_eq!(
+        r[0].url,
+        "https://twitter.com/alice/status/1234567890123456789"
+    );
+    assert!(r[0].snippet.contains("512 likes"));
+    assert_eq!(r[1].url, "https://x.com/i/status/9876543210987654321");
+}
+
+#[test]
+fn fxtwitter_base_url_override_routes_through_opts() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":200,"results":[
+                  {"id":"1111222233334444555","url":"https://x.com/i/status/1111222233334444555",
+                   "text":"self-hosted","author":{"screen_name":"ops"}}
+                ],"cursor":{"top":null,"bottom":null}}"#,
+            ))
+            .mount(&server)
+            .await;
+    });
+    // The default engine plus a configured self-host must reach the mock.
+    let engine = FxTwitter::default();
+    let opts = SearchOpts {
+        fxtwitter_base_url: Some(server.uri()),
+        ..opts()
+    };
+    let r = engine.search(&client(), "x", &opts).unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].title, "@ops");
+}
+
+#[test]
+fn fxtwitter_http_404_is_an_error_not_empty_results() {
+    // A no-match search answers HTTP 200 + `results: []`, so a 404 means the
+    // timeline is down and must surface instead of a confident empty answer.
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+    });
+    let engine = FxTwitter::with_base(format!("{}/2/search", server.uri()));
+    let err = engine.search(&client(), "x", &opts()).unwrap_err();
+    assert_eq!(err.kind(), "http");
+}
+
+#[test]
+fn telegram_channel_full_pipeline_with_pagination() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        // Specific `?before=` pages mount first: the plain path mock below
+        // matches any query string, so it must be the last resort.
+        Mock::given(method("GET"))
+            .and(path("/s/testchannel"))
+            .and(query_param("before", "80"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><div class="tgme_channel_info_header">testchannel</div>
+                <div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="testchannel/60">
+                  <div class="tgme_widget_message_text">Older post</div>
+                </div></div>
+                </body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/testchannel"))
+            .and(query_param("before", "60"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><div class="tgme_channel_info_header">testchannel</div></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/s/testchannel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body>
+                <div class="tgme_channel_info_header">testchannel</div>
+                <div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="testchannel/99">
+                  <div class="tgme_widget_message_text">First post</div>
+                  <a class="tgme_widget_message_date" href="https://t.me/testchannel/99"><time datetime="2026-09-20T10:00:00+00:00" class="time">Sep 20</time></a>
+                  <span class="tgme_widget_message_views">10</span>
+                </div></div>
+                <div class="tgme_widget_message_wrap"><div class="tgme_widget_message" data-post="testchannel/80">
+                  <div class="tgme_widget_message_text">Second post</div>
+                </div></div>
+                </body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+    });
+    let engine = Telegram::with_base(server.uri());
+    let r = engine.search(&client(), "@testchannel", &opts()).unwrap();
+    assert_eq!(r.len(), 3);
+    assert_eq!(r[0].title, "@testchannel · 2026-09-20");
+    assert_eq!(r[0].url, "https://t.me/testchannel/99");
+    assert_eq!(r[0].snippet, "First post · 10 views");
+    assert_eq!(r[2].snippet, "Older post");
+    assert!(r[2].url.ends_with("/testchannel/60"));
+}
+
+#[test]
+fn telegram_unknown_channel_redirect_is_no_results() {
+    let rt = setup_runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/s/nopeeeee"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/nopeeeee"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nopeeeee"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+    });
+    let engine = Telegram::with_base(server.uri());
+    let err = engine.search(&client(), "nopeeeee", &opts()).unwrap_err();
+    assert_eq!(err.kind(), "no_results");
+    assert!(
+        err.to_string().contains("unknown or private channel"),
+        "got: {err}"
+    );
 }
 
 #[test]

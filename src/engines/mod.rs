@@ -15,12 +15,14 @@
 pub mod academic;
 pub mod bing;
 pub mod duckduckgo;
+pub mod fxtwitter;
 pub mod hackernews;
 pub mod images;
 pub mod nominatim;
 pub mod packages;
 pub mod reddit;
 pub mod stackexchange;
+pub mod telegram;
 pub mod wikipedia;
 
 use reqwest::blocking::Client;
@@ -124,6 +126,24 @@ pub static TEXT_REGISTRY: &[EngineSpec] = &[
         description: "Reddit posts via public RSS (no key; rate-limit-strict, use sparingly).",
         example: "webseek search \"rust\" --engine reddit",
         build: || Box::<reddit::Reddit>::default(),
+    },
+    EngineSpec {
+        name: "fxtwitter",
+        aliases: &["fx", "x"],
+        kind: "news",
+        description:
+            "X/Twitter posts via the FxTwitter API (no key; self-host with fxtwitter_base_url).",
+        example: "webseek search \"rust\" --engine fxtwitter",
+        build: || Box::<fxtwitter::FxTwitter>::default(),
+    },
+    EngineSpec {
+        name: "telegram",
+        aliases: &["tg"],
+        kind: "news",
+        description:
+            "Public Telegram channel posts (no key; the query is a channel: @name or t.me/name).",
+        example: "webseek search \"@telegram\" --engine telegram",
+        build: || Box::<telegram::Telegram>::default(),
     },
     EngineSpec {
         name: "stackexchange",
@@ -436,7 +456,15 @@ mod tests {
     fn verticals_never_fall_back_to_web_search() {
         // A vertical answers a different question; substituting a web engine
         // would hand back results the agent cannot distinguish.
-        for vertical in ["pubmed", "crates", "wikipedia", "nominatim", "reddit"] {
+        for vertical in [
+            "pubmed",
+            "crates",
+            "wikipedia",
+            "nominatim",
+            "reddit",
+            "fxtwitter",
+            "telegram",
+        ] {
             assert_eq!(
                 fallback_order(vertical),
                 vec![vertical],

@@ -70,6 +70,9 @@ pub struct TomlConfig {
     /// Contact address sent to APIs that ask for one (OpenAlex "polite pool",
     /// NCBI E-utilities). Empty means "don't claim a contact".
     pub contact_email: Option<String>,
+    /// Self-hosted FxTwitter API host (e.g. `https://fx.example.com`).
+    /// `None` means the public `https://api.fxtwitter.com` endpoint.
+    pub fxtwitter_base_url: Option<String>,
     pub safe_search: bool,
     pub lang: Option<String>,
     pub region: Option<String>,
@@ -108,6 +111,7 @@ impl Default for TomlConfig {
             timeout_secs: 15,
             user_agent: DEFAULT_USER_AGENT.into(),
             contact_email: None,
+            fxtwitter_base_url: None,
             safe_search: false,
             lang: None,
             region: None,
@@ -135,6 +139,7 @@ pub struct Config {
     pub timeout: std::time::Duration,
     pub user_agent: String,
     pub contact_email: Option<String>,
+    pub fxtwitter_base_url: Option<String>,
     pub safe_search: bool,
     pub lang: Option<String>,
     pub region: Option<String>,
@@ -183,6 +188,7 @@ impl Config {
             image_engine: t.image_engine,
             user_agent: t.user_agent,
             contact_email: t.contact_email.filter(|c| !c.trim().is_empty()),
+            fxtwitter_base_url: t.fxtwitter_base_url.filter(|u| !u.trim().is_empty()),
             safe_search: t.safe_search,
             lang: t.lang,
             region: t.region,
@@ -228,7 +234,8 @@ impl Config {
              # so they appear here as comments rather than as empty settings.\n\
              # contact_email = \"you@example.com\"\n\
              # lang = \"ja\"          # engine-dependent\n\
-             # region = \"jp\"        # or \"en-us\", \"EN_US\", ...\n",
+             # region = \"jp\"        # or \"en-us\", \"EN_US\", ...\n\
+             # fxtwitter_base_url = \"https://fx.example.com\"  # self-hosted FxTwitter API host\n",
             toml::to_string_pretty(&TomlConfig::default())
                 .map_err(|e| Error::Config(e.to_string()))?
         );
@@ -386,6 +393,19 @@ mod tests {
         assert_eq!(back.engine, "duckduckgo");
         assert_eq!(back.max_results, 5);
         assert_eq!(back.max_chars, 20_000);
+    }
+
+    #[test]
+    fn fxtwitter_base_url_is_optional_and_blank_means_unset() {
+        let with: TomlConfig =
+            toml::from_str("fxtwitter_base_url = \"https://fx.example.com\"\n").unwrap();
+        assert_eq!(
+            Config::from_toml(with).fxtwitter_base_url.as_deref(),
+            Some("https://fx.example.com")
+        );
+        let blank: TomlConfig = toml::from_str("fxtwitter_base_url = \"  \"\n").unwrap();
+        assert_eq!(Config::from_toml(blank).fxtwitter_base_url, None);
+        assert_eq!(Config::default().fxtwitter_base_url, None);
     }
 
     #[test]
