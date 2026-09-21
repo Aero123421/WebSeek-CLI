@@ -51,14 +51,14 @@ it against `SHA256SUMS.txt`, and put the `webseek` binary on your PATH:
 
 ```sh
 # Linux / macOS
-tar -xzf webseek-v0.6.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf webseek-v0.6.1-x86_64-unknown-linux-gnu.tar.gz
 chmod +x webseek
 sudo mv webseek /usr/local/bin/
 ```
 
 ```powershell
 # Windows
-Expand-Archive webseek-v0.6.0-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
+Expand-Archive webseek-v0.6.1-x86_64-pc-windows-msvc.zip -DestinationPath C:\bin
 ```
 
 Or build from source (Rust 1.86+, checked in CI):
@@ -585,8 +585,8 @@ Nothing is published to crates.io.
 To publish a release:
 
 ```sh
-git tag v0.6.0
-git push origin v0.6.0
+git tag v0.6.1
+git push origin v0.6.1
 ```
 
 ## Roadmap

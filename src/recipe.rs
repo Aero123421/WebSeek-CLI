@@ -1080,8 +1080,11 @@ output: {format: jsonl, file: ./out.jsonl}
 
     #[test]
     fn search_steps_accept_time_bounds_and_feed() {
+        // Both bounds are relative: an absolute `until` is fixed in wall-clock
+        // time while `since: 24h` keeps sliding, so any absolute date becomes
+        // an empty window once it falls behind now-24h.
         let r = parse(
-            "version: 1\nsteps:\n  - search: {engine: fxtwitter, query: y, since: 24h, until: 2026-09-20, feed: top}\n",
+            "version: 1\nsteps:\n  - search: {engine: fxtwitter, query: y, since: 24h, until: 1h, feed: top}\n",
         )
         .unwrap();
         match &r.steps[0] {
@@ -1089,7 +1092,7 @@ output: {format: jsonl, file: ./out.jsonl}
                 since, until, feed, ..
             } => {
                 assert_eq!(since.as_deref(), Some("24h"));
-                assert_eq!(until.as_deref(), Some("2026-09-20"));
+                assert_eq!(until.as_deref(), Some("1h"));
                 assert_eq!(feed.as_deref(), Some("top"));
             }
             _ => panic!("must be a search"),

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-21
+
+### Fixed
+
+- A recipe-parser unit test combined the relative `since: 24h` with the
+  absolute `until: 2026-09-20`, so the window went empty once the release
+  date passed and the test failed on any later day. Both bounds are now
+  relative, so the test is time-independent. No user-visible change.
+
 ## [0.6.0] - 2026-09-20
 
 ### Added
