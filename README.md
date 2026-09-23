@@ -94,6 +94,10 @@ webseek fetch https://a.example https://b.example https://c.example -j 4 --json
 # Always get an array, even for one URL (one shape for your parser)
 webseek fetch https://a.example --array --json
 
+# Keep only the passages that answer your question (BM25, CJK-aware)
+webseek fetch https://doc.rust-lang.org/book/ch16-01-threads.html --query "join handle" --passages 3
+webseek fetch https://ja.wikipedia.org/wiki/Rust --query "所有権 借用"
+
 # Image search + download (no API key)
 webseek images "japanese garden" --count 8
 webseek images "mountain sunset" --download ./pics --limit 5 --max-bytes 5242880
@@ -121,6 +125,11 @@ webseek search "@telegram proxy"  --engine telegram     # ... with in-channel ke
 webseek search "from:XDevelopers OR from:X" --engine fxtwitter --since 24h
 webseek search "rust async" --engine hackernews --since 7d --until 2026-09-20
 webseek search "rust" --engine fxtwitter --feed top   # latest (default) | top | media
+
+# Monitoring: emit only results no earlier run of this watch emitted
+webseek search "rust" --engine hackernews --watch hn-rust   # run from cron
+webseek watch list
+webseek watch clear hn-rust
 
 # Discover every engine and what it's for (machine-readable)
 webseek engines --json
@@ -242,6 +251,15 @@ results never match a set bound.
 {"url":"https://...","title":"...","chars":12034,"truncated":false,"text":"..."}
 ```
 
+`fetch --query` adds `focus` (the key is absent otherwise). `text` then holds
+only the kept passages, joined by a blank line in page order, and `truncated`
+is `true` whenever any passage was left out:
+
+```json
+{"url":"https://...","title":"...","chars":1106,"truncated":true,"text":"...",
+ "focus":{"query":"join handle","total":27,"passages":[{"index":9,"score":4.947},{"index":12,"score":3.55}]}}
+```
+
 `images` — `downloaded` is present only when `--download` was passed, so test
 for the key rather than for a null:
 
@@ -291,6 +309,60 @@ all items failed.
   the character cap *and* the line cap, so `false` really means "this is the
   whole page".
 
+### Focused fetch (`--query`)
+
+`fetch --query "<question>"` extracts the page as usual, splits it into
+passages of about 600 characters (a heading stays with its body), scores
+every passage against the query with Okapi BM25, and keeps the best
+`--passages N` (default 5, max 50) **in page order**. It is purely lexical —
+no model, no key, and deterministic.
+
+- Latin-script text matches on lowercase words (a short English stopword list
+  is ignored). Japanese, Chinese and Korean have no word spaces, so they match
+  on overlapping character bigrams: `非同期` finds `非同期処理`. Full-width ASCII
+  is folded, so `ＲＵＳＴ` matches `rust`.
+- Only passages that contain a query term are kept. A page that never
+  mentions the topic returns empty `text` with `focus.passages: []`, rather
+  than an unrelated lead paragraph.
+- The whole page is ranked first and `--max-chars` then caps the selection,
+  so a long page is not ranked by its first 20 000 characters only.
+- A query with nothing searchable in it (only punctuation or stopwords) fails
+  before any request. `--query` cannot be combined with `--html`.
+
+Recipe fetch steps accept the same `query` and `passages` keys, so the digest
+snippet comes from the matching passages.
+
+### Watch mode (`--watch`)
+
+`search --watch NAME` and `run --watch NAME` emit only results whose URL no
+earlier run of the same watch emitted, then remember them. Run the same
+command from cron and each run prints only what is new:
+
+```sh
+webseek search "from:XDevelopers" --engine fxtwitter --watch x-dev --jsonl
+webseek run digest.yaml --watch digest     # or `watch: digest` in the recipe
+```
+
+- The first run is the baseline: everything is new.
+- A watch run always queries upstream (it does not read the response cache),
+  so a new item cannot stay hidden until a cached answer expires.
+- URLs are recorded only **after** output was written, so a failed write or
+  closed pipe never marks an item as seen. Repeats within one run are dropped.
+- In a recipe, filtering happens before `combine`, so `limit` counts new
+  items only; the ones it cuts stay unseen and appear on the next run.
+- The watch is locked from reading to saving, so overlapping cron runs cannot
+  both emit the same item. An unreadable state file is an error, not a silent
+  reset that would re-announce everything.
+- Each watch remembers up to 20 000 URLs and forgets the oldest first. Names
+  use `A-Z a-z 0-9 - _ .` (max 64 characters).
+- `--verbose` prints `watch 'NAME': N new, M already seen` on stderr.
+
+`webseek watch list` shows each watch, how many URLs it remembers, and when
+it last saw something new. `webseek watch clear NAME...` (or `--all`) forgets
+watches, so their next run is a baseline again. State lives in the platform
+data directory (`~/.local/share/webseek/watch` on Linux); set
+`WEBSEEK_WATCH_DIR` to override it.
+
 ### Bulk research
 
 Prefer batch mode over a shell loop: one process paces its own requests, and
@@ -336,9 +408,12 @@ output: {format: jsonl}
   as the CLI flags) and `feed` (`latest`/`top`/`media`, fxtwitter only).
   Step `lang`/`region` only reach engines that read them; the Accept-Language
   header always comes from the CLI/config `--lang`. Fetch steps take `urls`
-  plus optional `max_chars` (default is config `max_chars`, max 10M) and
-  `jobs` (default 1). A fetched page joins the list as a digest item
-  (title + excerpt); full text stays available through `fetch` itself.
+  plus optional `max_chars` (default is config `max_chars`, max 10M),
+  `jobs` (default 1), and `query` / `passages` (as `fetch --query`). A
+  fetched page joins the list as a digest item (title + excerpt); full text
+  stays available through `fetch` itself.
+- `watch: NAME` (top level, `${var}` allowed) turns the recipe into a watch;
+  `run --watch NAME` overrides it. See "Watch mode".
 - `${var}` interpolates `vars` in any string value (`$$` escapes); a lone
   `${var}` keeps its type, so `count: "${n}"` works with `n: 10` (string
   fields also accept numbers, but numeric fields need numeric vars). Vars may

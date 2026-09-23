@@ -42,7 +42,7 @@ pub struct ImageResult {
 }
 
 /// Result of fetching a single page.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FetchResult {
     pub url: String,
     pub title: Option<String>,
@@ -50,8 +50,12 @@ pub struct FetchResult {
     pub chars: usize,
     /// True when content was dropped by any cap (bytes, characters or lines).
     pub truncated: bool,
-    /// Boilerplate-free main content.
+    /// Boilerplate-free main content. With `--query`, only the selected
+    /// passages, joined by a blank line in document order.
     pub text: String,
+    /// Present only with `--query`: which passages `text` holds and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::passages::Focus>,
 }
 
 /// Options passed to a search engine.
@@ -166,6 +170,10 @@ pub struct FetchOpts {
     pub raw_html: bool,
     /// Keep light markdown formatting (headings, lists, links).
     pub markdown: bool,
+    /// Keep only the passages that best match this query (`--query`).
+    pub query: Option<String>,
+    /// How many passages `query` keeps at most (`--passages`).
+    pub passages: usize,
 }
 
 impl Default for FetchOpts {
@@ -175,6 +183,8 @@ impl Default for FetchOpts {
             max_chars: 20_000,
             raw_html: false,
             markdown: false,
+            query: None,
+            passages: crate::passages::DEFAULT_PASSAGES,
         }
     }
 }

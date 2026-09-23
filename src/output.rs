@@ -271,6 +271,15 @@ pub fn write_fetch_to(w: &mut impl Write, mode: Mode, fetch: &FetchResult) -> st
                 fetch.chars,
                 if fetch.truncated { " (truncated)" } else { "" }
             )?;
+            if let Some(focus) = &fetch.focus {
+                writeln!(
+                    w,
+                    "focus \"{}\": {} of {} passages",
+                    sanitize_line(&focus.query),
+                    focus.passages.len(),
+                    focus.total
+                )?;
+            }
             writeln!(w, "---")?;
             writeln!(w, "{}", sanitize_text(&fetch.text))?;
         }
@@ -404,6 +413,43 @@ pub fn write_engines_to(
                     alias
                 )?;
                 writeln!(w, "    {}", paint(e.example, "2"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Watch state for `webseek watch list`: same shape rules as `engines`
+/// (a JSON array, or one object per JSONL line).
+pub fn write_watches(mode: Mode, watches: &[crate::watch::WatchInfo]) -> std::io::Result<()> {
+    let out = std::io::stdout();
+    write_watches_to(&mut out.lock(), mode, watches)
+}
+
+pub fn write_watches_to(
+    w: &mut impl Write,
+    mode: Mode,
+    watches: &[crate::watch::WatchInfo],
+) -> std::io::Result<()> {
+    match mode {
+        Mode::Json => writeln!(w, "{}", serde_json::to_string(watches)?)?,
+        Mode::Jsonl => {
+            for info in watches {
+                writeln!(w, "{}", serde_json::to_string(info)?)?;
+            }
+        }
+        Mode::Pretty => {
+            if watches.is_empty() {
+                writeln!(w, "No watches.")?;
+            }
+            for info in watches {
+                writeln!(
+                    w,
+                    "{}  {} seen  last new: {}",
+                    paint(&sanitize_line(&info.name), "1"),
+                    info.seen,
+                    info.last_new.as_deref().unwrap_or("-")
+                )?;
             }
         }
     }
@@ -584,6 +630,7 @@ mod tests {
             chars: 5,
             truncated: false,
             text: "hello".into(),
+            focus: None,
         }
     }
 

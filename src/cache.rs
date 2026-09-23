@@ -336,26 +336,9 @@ impl Cache {
     }
 
     fn write_atomic(&self) -> std::io::Result<()> {
-        let dir = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
         let bytes =
             serde_json::to_vec(&self.entries).map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Random name in the destination directory: same filesystem (so the
-        // rename is atomic) and no fixed `cache.json.tmp` to collide on.
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".webseek-cache-")
-            .suffix(".tmp")
-            .tempfile_in(&dir)?;
-        restrict_permissions(tmp.as_file());
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.persist(&self.path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(())
+        write_private_atomic(&self.path, &bytes)
     }
 
     /// Evict least-recently-used entries until both budgets are satisfied.
@@ -421,6 +404,28 @@ fn read_file(path: &Path) -> Option<HashMap<String, CachedValue>> {
     }
 }
 
+/// Replace `path` with `bytes` atomically, as a private (`0600`) file.
+///
+/// Random name in the destination directory: same filesystem (so the rename
+/// is atomic) and no fixed `*.tmp` name to collide on.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".webseek-")
+        .suffix(".tmp")
+        .tempfile_in(&dir)?;
+    restrict_permissions(tmp.as_file());
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.persist(path)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn restrict_permissions(file: &File) {
     use std::os::unix::fs::PermissionsExt;
@@ -434,12 +439,12 @@ fn restrict_permissions(_file: &File) {}
 ///
 /// Best-effort by design: if locking is unavailable the cache still works, it
 /// just loses the concurrency guarantee.
-struct FileLock {
+pub(crate) struct FileLock {
     _file: Option<File>,
 }
 
 impl FileLock {
-    fn acquire(target: &Path) -> Self {
+    pub(crate) fn acquire(target: &Path) -> Self {
         let mut lock_path = target.as_os_str().to_os_string();
         lock_path.push(".lock");
         let file = OpenOptions::new()
@@ -483,15 +488,25 @@ pub fn cache_key(parts: &[&str]) -> String {
 
 /// Key for a page fetch. Shared by single and batch fetch paths.
 pub fn fetch_key(url: &str, opts: &crate::models::FetchOpts, allow_private: bool) -> String {
-    cache_key(&[
+    let max_bytes = opts.max_bytes.to_string();
+    let max_chars = opts.max_chars.to_string();
+    let raw_html = opts.raw_html.to_string();
+    let markdown = opts.markdown.to_string();
+    let passages = opts.passages.to_string();
+    let mut parts = vec![
         "fetch",
         url,
-        &opts.max_bytes.to_string(),
-        &opts.max_chars.to_string(),
-        &opts.raw_html.to_string(),
-        &opts.markdown.to_string(),
+        &max_bytes,
+        &max_chars,
+        &raw_html,
+        &markdown,
         if allow_private { "1" } else { "0" },
-    ])
+    ];
+    // Appended only when set, so plain fetches keep their existing keys.
+    if let Some(q) = opts.query.as_deref() {
+        parts.extend(["query", q, &passages]);
+    }
+    cache_key(&parts)
 }
 
 /// Key by requested engine, not fallback responder, so a repeated request can
@@ -713,11 +728,30 @@ mod tests {
                 markdown: true,
                 ..fetch.clone()
             },
+            crate::models::FetchOpts {
+                query: Some("rust".into()),
+                ..fetch.clone()
+            },
         ] {
             assert_ne!(base, fetch_key("https://x", &changed, false));
         }
         assert_ne!(base, fetch_key("https://y", &fetch, false));
         assert_ne!(base, fetch_key("https://x", &fetch, true));
+        // The passage budget matters only with a query, and then it does.
+        let passages = crate::models::FetchOpts {
+            passages: 9,
+            ..fetch.clone()
+        };
+        assert_eq!(base, fetch_key("https://x", &passages, false));
+        let q = |n: usize| crate::models::FetchOpts {
+            query: Some("rust".into()),
+            passages: n,
+            ..fetch.clone()
+        };
+        assert_ne!(
+            fetch_key("https://x", &q(3), false),
+            fetch_key("https://x", &q(4), false)
+        );
 
         let search = crate::models::SearchOpts::default();
         let base = search_key("bing", "q", &search, true);

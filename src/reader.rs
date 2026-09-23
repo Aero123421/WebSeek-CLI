@@ -136,10 +136,21 @@ fn build_result_with_base(
             chars: text.chars().count(),
             truncated: body_capped || over_char_cap,
             text,
+            focus: None,
         });
     }
 
     let (title, text, lines_dropped) = extract_text_inner_with_base(raw, opts.markdown, base_url)?;
+    // `--query` ranks the *whole* extracted page, then the character cap
+    // applies to what was kept: capping first would rank only the lead.
+    let (text, focus, passages_dropped) = match opts.query.as_deref() {
+        Some(q) => {
+            let sel = crate::passages::select(&text, q, opts.passages);
+            let dropped = sel.dropped_any();
+            (sel.text, Some(sel.focus), dropped)
+        }
+        None => (text, None, false),
+    };
     let total = text.chars().count();
     let over_char_cap = total > max_chars;
     let text = if over_char_cap {
@@ -151,8 +162,9 @@ fn build_result_with_base(
         url: url.to_string(),
         title,
         chars: text.chars().count(),
-        truncated: body_capped || over_char_cap || lines_dropped,
+        truncated: body_capped || over_char_cap || lines_dropped || passages_dropped,
         text,
+        focus,
     })
 }
 
@@ -800,6 +812,7 @@ mod tests {
             max_chars,
             raw_html,
             markdown,
+            ..FetchOpts::default()
         }
     }
 

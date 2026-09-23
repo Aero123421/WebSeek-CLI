@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `fetch --query "<text>"` keeps only the passages that best match the query
+  (Okapi BM25, in page order), with `--passages N` (default 5, max 50). CJK
+  text is matched by character bigrams, so Japanese, Chinese and Korean
+  queries work without a dictionary. The JSON gains an optional `focus`
+  object (`query`, `total`, `passages[{index, score}]`), and `truncated` is
+  `true` when passages were left out. Recipe fetch steps accept `query` and
+  `passages`.
+- `search --watch NAME` and `run --watch NAME` (or a recipe's top-level
+  `watch:` key) emit only results whose URL earlier runs of that watch did
+  not, which makes cron monitoring straightforward. A watch run always queries
+  upstream, records URLs only after output succeeds, and is locked across
+  processes. New `webseek watch list` and `webseek watch clear NAME|--all`
+  commands; `WEBSEEK_WATCH_DIR` overrides where state is stored.
+
 ## [0.6.1] - 2026-09-23
 
 ### Fixed
