@@ -1,6 +1,6 @@
 [package]
 name = "webseek"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 # Verified in CI by building the binary with exactly this toolchain. The
 # previously declared 1.75 was never checked and had not been true for some
