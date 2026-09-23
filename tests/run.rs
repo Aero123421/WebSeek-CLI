@@ -41,6 +41,7 @@ impl Cli {
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_CACHE_HOME", self.home.path().join("cache"))
             .env("WEBSEEK_CACHE_DIR", self.home.path().join("webseek-cache"))
+            .env("WEBSEEK_WATCH_DIR", self.home.path().join("webseek-watch"))
             .env("APPDATA", self.home.path().join("appdata"))
             .env("LOCALAPPDATA", self.home.path().join("localappdata"))
             .env_remove("WEBSEEK_CONFIG")
@@ -446,6 +447,7 @@ fn run_reads_stdin_with_dash() {
         .env("XDG_CONFIG_HOME", cli.home.path().join("config"))
         .env("XDG_CACHE_HOME", cli.home.path().join("cache"))
         .env("WEBSEEK_CACHE_DIR", cli.home.path().join("webseek-cache"))
+        .env("WEBSEEK_WATCH_DIR", cli.home.path().join("webseek-watch"))
         .env_remove("WEBSEEK_CONFIG")
         .env_remove("NO_COLOR")
         .env("RUST_BACKTRACE", "0");
@@ -457,4 +459,160 @@ fn run_reads_stdin_with_dash() {
         .assert()
         .success()
         .stdout(predicate::str::contains(r#""count":1"#));
+}
+
+// ---------------------------------------------------------------------------
+// --watch
+// ---------------------------------------------------------------------------
+
+const FX_THIRD: &str = r#"{"code":200,"results":[
+  {"id":"3333444455556666777","url":"https://x.com/carol/status/3333444455556666777",
+   "text":"third post","likes":0,"reposts":0,"replies":0,"author":{"screen_name":"carol"}},
+  {"id":"1111222233334444555","url":"https://x.com/alice/status/1111222233334444555",
+   "text":"first post","likes":5,"reposts":1,"replies":0,"author":{"screen_name":"alice"}}
+],"cursor":{"top":null,"bottom":null}}"#;
+
+fn urls_of(stdout: &[u8]) -> Vec<String> {
+    let doc: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+    doc["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["url"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn search_watch_emits_only_new_urls_and_bypasses_the_cache() {
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    let mount = |body: &'static str| {
+        rt.block_on(async {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/2/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        })
+    };
+    let cli = Cli::new();
+    let config = fx_config(&cli, &server);
+    let search = || {
+        let out = cli
+            .cmd()
+            .arg("--config")
+            .arg(&config)
+            .args(["search", "rust", "--engine", "fxtwitter", "--json"])
+            .args(["--delay", "0", "--watch", "fx-rust"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        urls_of(&out.stdout)
+    };
+
+    mount(FX_HITS);
+    assert_eq!(
+        search().len(),
+        2,
+        "first run is the baseline: everything is new"
+    );
+    assert!(search().is_empty(), "nothing new on an unchanged upstream");
+
+    // Upstream changes; the stale cached answer must not hide it.
+    mount(FX_THIRD);
+    assert_eq!(
+        search(),
+        vec!["https://x.com/carol/status/3333444455556666777".to_string()]
+    );
+
+    // `watch list` reports the remembered URLs; `clear` resets the baseline.
+    let out = cli
+        .cmd()
+        .args(["watch", "list", "--json"])
+        .output()
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list[0]["name"], serde_json::json!("fx-rust"));
+    assert_eq!(list[0]["seen"], serde_json::json!(3));
+    cli.cmd()
+        .args(["watch", "clear", "fx-rust", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#"{"cleared":1}"#));
+    assert_eq!(search().len(), 2);
+}
+
+#[test]
+fn watch_names_are_validated_and_clear_needs_a_target() {
+    let cli = Cli::new();
+    cli.cmd()
+        .args([
+            "search",
+            "rust",
+            "--engine",
+            "fxtwitter",
+            "--watch",
+            "../etc",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("invalid watch name"));
+    cli.cmd().args(["watch", "clear"]).assert().code(2);
+    cli.cmd()
+        .args(["watch", "clear", "--all", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#"{"cleared":0}"#));
+}
+
+#[test]
+fn run_watch_limit_counts_new_items_and_leaves_the_rest_for_later() {
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FX_HITS))
+            .mount(&server)
+            .await;
+    });
+    let cli = Cli::new();
+    let config = fx_config(&cli, &server);
+    let recipe = cli.write(
+        "flow.yaml",
+        r#"version: 1
+watch: digest
+steps:
+  - search: {engine: fxtwitter, query: "rust", count: 2}
+combine: {limit: 1}
+"#,
+    );
+    let run = || {
+        let out = cli
+            .cmd()
+            .arg("--config")
+            .arg(&config)
+            .args(["run", "--json", "--delay", "0"])
+            .arg(&recipe)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        urls_of(&out.stdout)
+    };
+    // The item `limit` cut on the first run is still new on the second.
+    assert_eq!(
+        run(),
+        vec!["https://x.com/alice/status/1111222233334444555"]
+    );
+    assert_eq!(run(), vec!["https://x.com/bob/status/2222333344445555666"]);
+    assert!(run().is_empty());
 }

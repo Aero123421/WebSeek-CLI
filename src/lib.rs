@@ -13,12 +13,14 @@ pub mod models;
 pub mod net;
 pub mod output;
 pub mod pace;
+pub mod passages;
 pub mod reader;
 pub mod recipe;
 pub mod region;
 pub mod robots;
 pub mod text;
 pub mod time;
+pub mod watch;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -31,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{BatchCtx, BatchItem};
 use crate::cache::Cache;
-use crate::cli::{CacheCommand, Cli, Command, ConfigCommand};
+use crate::cli::{CacheCommand, Cli, Command, ConfigCommand, WatchCommand};
 use crate::engines::{engine_by_name, image_engine_by_name};
 use crate::error::Error;
 use crate::models::{FetchOpts, SearchOpts, SearchResult};
@@ -81,6 +83,30 @@ pub fn run() -> Result<()> {
             let mut cmd = Cli::command();
             let bin = cmd.get_name().to_string();
             clap_complete::generate(*shell, &mut cmd, bin, &mut std::io::stdout());
+            return Ok(());
+        }
+        Command::Watch { action } => {
+            match action {
+                WatchCommand::List => output::write_watches(mode, &watch::list()?)?,
+                WatchCommand::Clear { names, all } => {
+                    let names: Vec<String> = if *all {
+                        watch::list()?.into_iter().map(|w| w.name).collect()
+                    } else {
+                        // Validate every name before removing any.
+                        for n in names {
+                            watch::validate_name(n)?;
+                        }
+                        names.clone()
+                    };
+                    let mut cleared = 0usize;
+                    for n in &names {
+                        if watch::clear(n)? {
+                            cleared += 1;
+                        }
+                    }
+                    output::write_property(mode, "cleared", serde_json::json!(cleared))?;
+                }
+            }
             return Ok(());
         }
         Command::Config {
@@ -266,6 +292,7 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
         | Command::Engines
         | Command::Completions { .. }
         | Command::Cache { .. }
+        | Command::Watch { .. }
         | Command::Config { .. } => {
             unreachable!("handled before config load")
         }
@@ -282,8 +309,12 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             until,
             feed,
             open,
+            watch,
         } => {
             let name = engine.as_deref().unwrap_or(&ctx.cfg.engine);
+            if let Some(w) = watch {
+                watch::validate_name(w)?;
+            }
             // Validate time bounds and feed before any request, so a typo
             // fails fast instead of after a slow upstream round trip.
             crate::time::parse_window(since.as_deref(), until.as_deref(), "--since", "--until")?;
@@ -296,10 +327,17 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             opts.feed.clone_from(feed);
             ctx.trace(&format!("searching '{query}' via {name}"));
 
-            let (results, engine_used) = search_with_cache(ctx, name, query, &opts)?;
+            let (results, engine_used) =
+                search_with_cache(ctx, name, query, &opts, watch.is_some())?;
+            let (results, state) = watch_filter(ctx, watch.as_deref(), results)?;
             // Print the results first: `--open` is an extra action, not a
             // reason to produce no output on a `--json` run.
             write_search(ctx.mode, query, engine_used, &results)?;
+            // Only what was actually written counts as seen.
+            if let Some(mut state) = state {
+                state.record(results.iter().map(|r| r.url.as_str()));
+                state.save()?;
+            }
 
             if let Some(idx) = open {
                 let i = idx
@@ -318,6 +356,8 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             max_chars,
             markdown,
             html,
+            query,
+            passages,
             array,
             jobs,
             fail_on_any_error,
@@ -332,11 +372,16 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
                 return Ok(());
             }
 
+            if let Some(q) = query {
+                check_query(q)?;
+            }
             let opts = FetchOpts {
                 max_bytes: reader::DEFAULT_MAX_BYTES,
                 max_chars: max_chars.unwrap_or(ctx.cfg.max_chars).max(1),
                 raw_html: *html,
                 markdown: *markdown,
+                query: query.clone(),
+                passages: passages.unwrap_or(passages::DEFAULT_PASSAGES),
             };
             let batch_ctx = BatchCtx {
                 client: ctx.client,
@@ -422,8 +467,12 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             Ok(())
         }
 
-        Command::Run { file } => {
+        Command::Run { file, watch } => {
             let recipe = recipe::parse(&recipe::read_recipe(file)?)?;
+            if let Some(w) = watch {
+                watch::validate_name(w)?;
+            }
+            let watch_name = watch.as_deref().or(recipe.watch.as_deref());
             // An explicit CLI format flag wins over the recipe, mirroring the
             // config philosophy; a file sink without any format defaults to
             // JSON (there is no TTY to auto-detect from).
@@ -437,7 +486,10 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             } else {
                 ctx.mode
             };
-            let results = run_recipe(ctx, &recipe)?;
+            let results = run_recipe(ctx, &recipe, watch_name.is_some())?;
+            // Filter before combining, so `limit` counts new items only; the
+            // ones it cuts stay unseen and surface on the next run.
+            let (results, state) = watch_filter(ctx, watch_name, results)?;
             let combined = recipe::combine_results(results, &recipe.combine);
             if let Some(path) = recipe.output.as_ref().and_then(|o| o.file.as_ref()) {
                 recipe::check_sink_writable(path)?;
@@ -453,6 +505,10 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
             } else {
                 output::write_run(out_mode, &combined, recipe.steps.len())?;
             }
+            if let Some(mut state) = state {
+                state.record(combined.iter().map(|r| r.url.as_str()));
+                state.save()?;
+            }
             Ok(())
         }
     }
@@ -463,7 +519,7 @@ fn run_inner(ctx: &Ctx<'_>) -> Result<()> {
 ///
 /// A failing step warns and the run continues with the rest; only an
 /// all-steps-failed run is an error. Empty results are success, as everywhere.
-fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult>> {
+fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe, fresh: bool) -> Result<Vec<SearchResult>> {
     let total = recipe.steps.len();
     let mut out = Vec::new();
     let mut failed = 0usize;
@@ -503,7 +559,7 @@ fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult
                 if ctx.cli.verbose {
                     output::note(&format!("step {n}/{total}: search '{query}' via {engine}"));
                 }
-                match search_with_cache(ctx, engine, query, &opts) {
+                match search_with_cache(ctx, engine, query, &opts, fresh) {
                     Ok((results, _)) => out.extend(results),
                     Err(e) => {
                         failed += 1;
@@ -516,6 +572,8 @@ fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult
                 urls,
                 max_chars,
                 jobs,
+                query,
+                passages,
                 ..
             } => {
                 let fetch_opts = FetchOpts {
@@ -523,6 +581,8 @@ fn run_recipe(ctx: &Ctx<'_>, recipe: &recipe::Recipe) -> Result<Vec<SearchResult
                     max_chars: max_chars.unwrap_or(ctx.cfg.max_chars).max(1),
                     raw_html: false,
                     markdown: false,
+                    query: query.clone(),
+                    passages: passages.unwrap_or(passages::DEFAULT_PASSAGES),
                 };
                 let batch_ctx = BatchCtx {
                     client: ctx.client,
@@ -637,12 +697,47 @@ fn resolve_outcome<T>(
     }
 }
 
+/// Reject a `--query` that tokenizes to nothing: it could never select a
+/// passage, so every page would come back empty for no visible reason.
+fn check_query(q: &str) -> error::Result<()> {
+    if passages::query_terms(q).is_empty() {
+        return Err(Error::Config(format!(
+            "--query '{q}' has no searchable terms (only punctuation or stopwords)"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply `--watch`: drop results the watch already emitted and hand back the
+/// open (locked) state, so the caller can record what it actually writes.
+fn watch_filter(
+    ctx: &Ctx<'_>,
+    name: Option<&str>,
+    results: Vec<SearchResult>,
+) -> Result<(Vec<SearchResult>, Option<watch::Watch>)> {
+    let Some(name) = name else {
+        return Ok((results, None));
+    };
+    let state = watch::Watch::open(name)?;
+    let (fresh, known) = state.filter_new(results, |r| r.url.as_str());
+    ctx.trace(&format!(
+        "watch '{}': {} new, {known} already seen",
+        state.name(),
+        fresh.len()
+    ));
+    Ok((fresh, Some(state)))
+}
+
 /// Search honoring the cache, with automatic engine fallback.
+///
+/// `fresh` skips the cache *read* (the answer is still stored): a watch run
+/// must see upstream as it is now, or a new item would hide behind the TTL.
 fn search_with_cache(
     ctx: &Ctx<'_>,
     name: &str,
     query: &str,
     opts: &SearchOpts,
+    fresh: bool,
 ) -> Result<(Vec<SearchResult>, &'static str)> {
     // Validate up front: an unknown engine is the user's mistake and must
     // surface as-is rather than being quietly rerouted.
@@ -650,7 +745,10 @@ fn search_with_cache(
 
     let fallback_on = (ctx.cli.fallback || ctx.cfg.fallback) && !ctx.cli.no_fallback;
     let key = cache::search_key(requested, query, opts, fallback_on);
-    if let Some(hit) = cached::<SearchResult>(ctx, &key) {
+    if let Some(hit) = (!fresh)
+        .then(|| cached::<SearchResult>(ctx, &key))
+        .flatten()
+    {
         ctx.trace(&format!("{} results (cache hit)", hit.1));
         return Ok(hit);
     }

@@ -43,6 +43,7 @@ impl Cli {
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_CACHE_HOME", self.home.path().join("cache"))
             .env("WEBSEEK_CACHE_DIR", self.home.path().join("webseek-cache"))
+            .env("WEBSEEK_WATCH_DIR", self.home.path().join("webseek-watch"))
             .env("APPDATA", self.home.path().join("appdata"))
             .env("LOCALAPPDATA", self.home.path().join("localappdata"))
             .env_remove("WEBSEEK_CONFIG")
@@ -61,6 +62,7 @@ impl Cli {
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_CACHE_HOME", self.home.path().join("cache"))
             .env("WEBSEEK_CACHE_DIR", self.home.path().join("webseek-cache"))
+            .env("WEBSEEK_WATCH_DIR", self.home.path().join("webseek-watch"))
             .env("APPDATA", self.home.path().join("appdata"))
             .env("LOCALAPPDATA", self.home.path().join("localappdata"))
             .env_remove("WEBSEEK_CONFIG")
@@ -897,4 +899,98 @@ fn completions_are_generated_for_supported_shells() {
             "{shell} completions look empty"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// fetch --query
+// ---------------------------------------------------------------------------
+
+const LONG_PAGE: &str = r#"<html><head><title>Guide</title></head><body><article>
+<h2>Installation</h2><p>Download the archive and verify its checksum before installing.</p>
+<h2>Cooking</h2><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod.</p>
+<h2>非同期処理</h2><p>Rustの非同期処理にはランタイムが必要です。</p>
+<h2>Gardening</h2><p>Ut enim ad minim veniam, quis nostrud exercitation ullamco.</p>
+</article></body></html>"#;
+
+#[test]
+fn fetch_query_keeps_only_matching_passages_and_reports_focus() {
+    let rt = runtime();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(LONG_PAGE))
+            .mount(&server)
+            .await;
+    });
+    let url = format!("{}/guide", server.uri());
+    let cli = Cli::new();
+
+    let out = cli
+        .cmd()
+        .args(["fetch", &url, "--markdown", "--json", "--delay", "0"])
+        .args(["--query", "非同期 ランタイム"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out.stdout);
+    let text = v["text"].as_str().unwrap();
+    assert!(text.contains("ランタイムが必要"), "{text}");
+    assert!(
+        !text.contains("Lorem"),
+        "unrelated passages are dropped: {text}"
+    );
+    assert_eq!(v["truncated"], serde_json::json!(true));
+    assert_eq!(v["chars"].as_u64().unwrap() as usize, text.chars().count());
+    assert_eq!(v["focus"]["query"], serde_json::json!("非同期 ランタイム"));
+    assert_eq!(v["focus"]["total"], serde_json::json!(4));
+    let kept = v["focus"]["passages"].as_array().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["index"], serde_json::json!(2));
+    assert!(kept[0]["score"].as_f64().unwrap() > 0.0);
+
+    // A plain fetch of the same page carries no `focus` key at all, and a
+    // cached focused answer is never served for it.
+    let out = cli
+        .cmd()
+        .args(["fetch", &url, "--markdown", "--json", "--delay", "0"])
+        .output()
+        .unwrap();
+    let v = json_of(&out.stdout);
+    assert!(v.get("focus").is_none());
+    assert!(v["text"].as_str().unwrap().contains("Lorem"));
+}
+
+#[test]
+fn fetch_query_validation_fails_before_any_request() {
+    let cli = Cli::new();
+    // Nothing searchable: a runtime (config) error, exit 1.
+    cli.cmd()
+        .args(["fetch", "http://127.0.0.1:9/x", "--query", "the of ?"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no searchable terms"));
+    // `--passages` without `--query`, or with `--html`: usage errors, exit 2.
+    cli.cmd()
+        .args(["fetch", "http://127.0.0.1:9/x", "--passages", "3"])
+        .assert()
+        .code(2);
+    cli.cmd()
+        .args(["fetch", "http://127.0.0.1:9/x", "--query", "rust", "--html"])
+        .assert()
+        .code(2);
+    cli.cmd()
+        .args([
+            "fetch",
+            "http://127.0.0.1:9/x",
+            "--query",
+            "rust",
+            "--passages",
+            "0",
+        ])
+        .assert()
+        .code(2);
 }

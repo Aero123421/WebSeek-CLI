@@ -56,6 +56,8 @@ pub struct Recipe {
     pub steps: Vec<Step>,
     pub combine: Option<Combine>,
     pub output: Option<Output>,
+    /// `watch: NAME` — emit only results earlier runs of this watch did not.
+    pub watch: Option<String>,
 }
 
 /// One executable step. `for_each` is unrolled into these during parsing.
@@ -80,6 +82,10 @@ pub enum Step {
         urls: Vec<String>,
         max_chars: Option<usize>,
         jobs: Option<usize>,
+        /// Focus each page on this query (like `fetch --query`), so the
+        /// digest snippet comes from the matching passages.
+        query: Option<String>,
+        passages: Option<usize>,
     },
 }
 
@@ -221,6 +227,10 @@ struct RawFetch {
     max_chars: Option<usize>,
     #[serde(default)]
     jobs: Option<usize>,
+    #[serde(default, deserialize_with = "de_opt_coerce_string")]
+    query: Option<String>,
+    #[serde(default)]
+    passages: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -276,10 +286,10 @@ pub fn parse(text: &str) -> Result<Recipe> {
         .ok_or_else(|| Error::Config("invalid recipe: top level must be a mapping".into()))?;
     for key in mapping.keys() {
         match key.as_str() {
-            Some("version" | "vars" | "steps" | "combine" | "output") => {}
+            Some("version" | "vars" | "steps" | "combine" | "output" | "watch") => {}
             _ => {
                 return Err(Error::Config(format!(
-                    "invalid recipe: unknown key '{key:?}' (expected version, vars, steps, combine, output)"
+                    "invalid recipe: unknown key '{key:?}' (expected version, vars, steps, combine, output, watch)"
                 )));
             }
         }
@@ -382,10 +392,12 @@ pub fn parse(text: &str) -> Result<Recipe> {
 
     let combine = parse_combine(mapping, &vars)?;
     let output = parse_output(mapping, &vars)?;
+    let watch = parse_watch(mapping, &vars)?;
     Ok(Recipe {
         steps,
         combine,
         output,
+        watch,
     })
 }
 
@@ -671,11 +683,33 @@ fn validate_step(step: SingleStep, step_no: usize) -> Result<Step> {
                     )));
                 }
             }
+            if let Some(q) = f.query.as_deref() {
+                if crate::passages::query_terms(q).is_empty() {
+                    return Err(Error::Config(format!(
+                        "invalid recipe step {step_no}: query '{q}' has no searchable terms"
+                    )));
+                }
+            }
+            if let Some(n) = f.passages {
+                if f.query.is_none() {
+                    return Err(Error::Config(format!(
+                        "invalid recipe step {step_no}: passages requires query"
+                    )));
+                }
+                if !(1..=crate::passages::MAX_PASSAGES).contains(&n) {
+                    return Err(Error::Config(format!(
+                        "invalid recipe step {step_no}: passages must be 1..={} (got {n})",
+                        crate::passages::MAX_PASSAGES
+                    )));
+                }
+            }
             Ok(Step::Fetch {
                 step_no,
                 urls: f.urls,
                 max_chars: f.max_chars,
                 jobs: f.jobs,
+                query: f.query,
+                passages: f.passages,
             })
         }
     }
@@ -744,6 +778,32 @@ fn parse_combine(
         sort,
         limit: raw.limit,
     }))
+}
+
+fn parse_watch(
+    mapping: &serde_yaml::Mapping,
+    vars: &HashMap<String, serde_yaml::Value>,
+) -> Result<Option<String>> {
+    let Some(raw) = mapping.get(serde_yaml::Value::from("watch")) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let raw = substitute(raw, vars, None)
+        .map_err(|e| Error::Config(format!("invalid recipe watch: {e}")))?;
+    let name = match raw {
+        serde_yaml::Value::String(s) => s,
+        serde_yaml::Value::Number(n) => n.to_string(),
+        _ => {
+            return Err(Error::Config(
+                "invalid recipe watch: must be a name string".into(),
+            ))
+        }
+    };
+    crate::watch::validate_name(&name)
+        .map_err(|e| Error::Config(format!("invalid recipe watch: {}", config_msg(e))))?;
+    Ok(Some(name))
 }
 
 fn parse_output(
@@ -1199,6 +1259,7 @@ output: {format: jsonl, file: ./out.jsonl}
             chars: 9,
             truncated: false,
             text: "hello world".into(),
+            focus: None,
         });
         assert_eq!(mapped.title, "A page");
         assert_eq!(mapped.url, "https://example.com/p");
@@ -1210,6 +1271,7 @@ output: {format: jsonl, file: ./out.jsonl}
             chars: 1,
             truncated: false,
             text: "x".into(),
+            focus: None,
         });
         assert_eq!(mapped.title, "https://example.com/q");
     }
@@ -1293,6 +1355,54 @@ output: {format: jsonl, file: ./out.jsonl}
         )
         .is_err());
         assert!(parse("version: 1\nsteps:\n  - fetch: {urls: [https://x], bogus: 1}\n").is_err());
+    }
+
+    #[test]
+    fn watch_key_is_optional_interpolated_and_validated() {
+        let r = parse("version: 1\nsteps:\n  - fetch: {urls: [\"https://x\"]}\n").unwrap();
+        assert_eq!(r.watch, None);
+        let r = parse(
+            "version: 1\nvars: {w: news}\nwatch: \"${w}-jp\"\nsteps:\n  - fetch: {urls: [\"https://x\"]}\n",
+        )
+        .unwrap();
+        assert_eq!(r.watch.as_deref(), Some("news-jp"));
+        for bad in ["\"../x\"", "[a]", "\".hidden\""] {
+            let err = parse(&format!(
+                "version: 1\nwatch: {bad}\nsteps:\n  - fetch: {{urls: [\"https://x\"]}}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("invalid recipe watch"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn fetch_steps_accept_a_focus_query() {
+        let r = parse(
+            "version: 1\nsteps:\n  - fetch: {urls: [\"https://x\"], query: install, passages: 2}\n",
+        )
+        .unwrap();
+        match &r.steps[0] {
+            Step::Fetch {
+                query, passages, ..
+            } => {
+                assert_eq!(query.as_deref(), Some("install"));
+                assert_eq!(*passages, Some(2));
+            }
+            other => panic!("expected fetch, got {other:?}"),
+        }
+        for (body, want) in [
+            ("query: \"the ?\"", "no searchable terms"),
+            ("passages: 2", "passages requires query"),
+            ("query: rust, passages: 0", "passages must be 1..=50"),
+        ] {
+            let err = parse(&format!(
+                "version: 1\nsteps:\n  - fetch: {{urls: [\"https://x\"], {body}}}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(want), "{body}: {err}");
+        }
     }
 
     #[test]
